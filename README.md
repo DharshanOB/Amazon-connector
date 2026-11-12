@@ -1,4 +1,4 @@
-### Amazon SP-API Extensions
+### Amazon Connector
 
 Clean custom Frappe extension app for Amazon SP-API
 
@@ -9,7 +9,7 @@ You can install this app using the [bench](https://github.com/frappe/bench) CLI:
 ```bash
 cd $PATH_TO_YOUR_BENCH
 bench get-app $URL_OF_THIS_REPO --branch N
-bench install-app amazon_spapi_ext
+bench install-app amazon_connector
 ```
 
 ### Contributing
@@ -17,7 +17,7 @@ bench install-app amazon_spapi_ext
 This app uses `pre-commit` for code formatting and linting. Please [install pre-commit](https://pre-commit.com/#installation) and enable it for this repository:
 
 ```bash
-cd apps/amazon_spapi_ext
+cd apps/amazon_connector
 pre-commit install
 ```
 

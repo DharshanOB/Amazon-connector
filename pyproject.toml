@@ -1,5 +1,5 @@
 [project]
-name = "amazon_spapi_ext"
+name = "amazon_connector"
 authors = [
     { name = "Custom", email = "admin@example.com"}
 ]

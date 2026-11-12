@@ -8,7 +8,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        files: "amazon_spapi_ext.*"
+        files: "amazon_connector.*"
         exclude: ".*json$|.*txt$|.*csv|.*md|.*svg"
       - id: check-merge-conflict
       - id: check-ast
@@ -38,11 +38,11 @@ repos:
         # Ignore any files that might contain jinja / bundles
         exclude: |
             (?x)^(
-                amazon_spapi_ext/public/dist/.*|
+                amazon_connector/public/dist/.*|
                 .*node_modules.*|
                 .*boilerplate.*|
-                amazon_spapi_ext/templates/includes/.*|
-                amazon_spapi_ext/public/js/lib/.*
+                amazon_connector/templates/includes/.*|
+                amazon_connector/public/js/lib/.*
             )$
 
 
@@ -55,12 +55,12 @@ repos:
         # Ignore any files that might contain jinja / bundles
         exclude: |
             (?x)^(
-                amazon_spapi_ext/public/dist/.*|
+                amazon_connector/public/dist/.*|
                 cypress/.*|
                 .*node_modules.*|
                 .*boilerplate.*|
-                amazon_spapi_ext/templates/includes/.*|
-                amazon_spapi_ext/public/js/lib/.*
+                amazon_connector/templates/includes/.*|
+                amazon_connector/public/js/lib/.*
             )$
 
 ci:
