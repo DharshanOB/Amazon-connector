@@ -3,6 +3,8 @@
 
 import time
 
+from urllib.parse import urlparse
+
 import dateutil
 import ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_repository as _upstream_repo
 import frappe
@@ -14,6 +16,7 @@ from amazon_connector.amazon_ext.lifecycle import (
 	cancel_erpnext_order_from_amazon,
 	create_sales_invoice_from_sales_order,
 	get_marketplace_id_for_setting,
+	get_or_create_leaf_account,
 	update_setting_sync_timestamp,
 )
 from amazon_connector.amazon_ext.listings import (
@@ -79,6 +82,35 @@ def get_state_name_from_pincode(country_code: str = "", pincode: str = "", fallb
 	return state
 
 
+_BLOCKED_ENDPOINT_HOSTS = {
+	"169.254.169.254",
+	"100.100.100.200",
+	"metadata.google.internal",
+	"fd00:ec2::254",
+}
+
+_PERMANENT_AUTH_ERROR_CODES = {
+	"invalid_client",
+	"invalid_grant",
+	"unauthorized_client",
+	"InvalidClientTokenId",
+	"SignatureDoesNotMatch",
+	"AccessDenied",
+}
+
+
+def _validate_endpoint_url(endpoint: str | None) -> str | None:
+	if not endpoint:
+		return None
+	parsed = urlparse(endpoint)
+	if parsed.scheme not in ("http", "https") or not parsed.netloc:
+		frappe.throw(_("Custom SP-API endpoint must be a valid HTTP(S) URL."))
+	host = (parsed.hostname or "").strip().lower()
+	if host in _BLOCKED_ENDPOINT_HOSTS or host.startswith("169.254."):
+		frappe.throw(_("Custom SP-API endpoint host is not allowed."))
+	return endpoint
+
+
 def resolve_custom_endpoint(amz_setting=None) -> str | None:
 	endpoint = None
 	if amz_setting is not None:
@@ -98,7 +130,7 @@ def resolve_custom_endpoint(amz_setting=None) -> str | None:
 			endpoint = None
 	if isinstance(endpoint, str):
 		endpoint = endpoint.strip().rstrip("/")
-	return endpoint or None
+	return _validate_endpoint_url(endpoint or None)
 
 
 class CustomAmazonRepository(_BaseAmazonRepository):
@@ -139,14 +171,19 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				title=f'Method "{sp_api_method.__name__}" failed',
 			)
 
-		setting_name = getattr(self.amz_setting, "name", None)
-		if setting_name and frappe.db.exists("Amazon SP API Settings", setting_name):
-			frappe.db.set_value("Amazon SP API Settings", setting_name, "enable_sync", 0)
-		else:
-			self.amz_setting.enable_sync = 0
+		# Only disable global scheduled sync on permanent credential/auth errors (not on transient 5xx/429 or single-record InvalidInput).
+		is_permanent_auth_error = bool(set(errors.keys()) & _PERMANENT_AUTH_ERROR_CODES)
+		if is_permanent_auth_error and sp_api_method.__name__ != "create_restricted_data_token":
+			setting_name = getattr(self.amz_setting, "name", None)
+			if setting_name and frappe.db.exists("Amazon SP API Settings", setting_name):
+				frappe.db.set_value("Amazon SP API Settings", setting_name, "enable_sync", 0)
+			else:
+				self.amz_setting.enable_sync = 0
 
 		frappe.throw(
-			_("Scheduled sync has been temporarily disabled because maximum retries have been exceeded!")
+			_("Amazon SP-API call failed after maximum retries: {0}").format(
+				", ".join(f"{k}: {v}" for k, v in errors.items()) or _("Unknown error")
+			)
 		)
 
 	def get_tokens_instance(self) -> Tokens:
@@ -206,14 +243,21 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 	def get_account(self, name) -> str:
 		company = self.amz_setting.company
 		account_name = frappe.db.get_value(
-			"Account", {"account_name": f"Amazon {name}", "company": company}, "name"
+			"Account", {"account_name": f"Amazon {name}", "company": company, "is_group": 0}, "name"
 		)
 
 		if not account_name:
+			parent_account = self.amz_setting.get("market_place_account_group")
+			if not parent_account:
+				return get_or_create_leaf_account(
+					company=company,
+					account_name=f"Amazon {name}",
+					root_type="Expense",
+				)
 			new_account = frappe.new_doc("Account")
 			new_account.account_name = f"Amazon {name}"
 			new_account.company = company
-			new_account.parent_account = self.amz_setting.market_place_account_group
+			new_account.parent_account = parent_account
 			new_account.insert(ignore_permissions=True)
 			account_name = new_account.name
 
@@ -222,12 +266,28 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 	def _append_order_item_charges_fallback(self, charges: list, raw_items: list) -> None:
 		for order_item in raw_items:
 			sku = order_item.get("SellerSKU") or order_item.get("ASIN") or "Order Item"
+			buyer_info = order_item.get("BuyerInfo") or {}
+			gift_wrap_dict = (
+				order_item.get("GiftWrapPrice")
+				or order_item.get("GiftWrap")
+				or buyer_info.get("GiftWrapPrice")
+				or {}
+			)
+			gift_wrap_tax_dict = (
+				order_item.get("GiftWrapTax")
+				or buyer_info.get("GiftWrapTax")
+				or {}
+			)
 			charge_specs = [
 				("Tax", flt((order_item.get("ItemTax") or {}).get("Amount"))),
 				("ShippingCharge", flt((order_item.get("ShippingPrice") or {}).get("Amount"))),
 				("ShippingTax", flt((order_item.get("ShippingTax") or {}).get("Amount"))),
-				("PromotionDiscount", -flt((order_item.get("PromotionDiscount") or {}).get("Amount"))),
-				("ShippingDiscount", -flt((order_item.get("ShippingDiscount") or {}).get("Amount"))),
+				("GiftWrap", flt(gift_wrap_dict.get("Amount"))),
+				("GiftWrapTax", flt(gift_wrap_tax_dict.get("Amount"))),
+				("CODFee", flt((order_item.get("CODFee") or {}).get("Amount"))),
+				("PromotionDiscount", -abs(flt((order_item.get("PromotionDiscount") or {}).get("Amount")))),
+				("ShippingDiscount", -abs(flt((order_item.get("ShippingDiscount") or {}).get("Amount")))),
+				("CODFeeDiscount", -abs(flt((order_item.get("CODFeeDiscount") or {}).get("Amount")))),
 			]
 			for charge_type, amount in charge_specs:
 				if amount != 0:
@@ -239,6 +299,19 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 							"description": f"{charge_type} for {sku}",
 						}
 					)
+			for withheld_entry in order_item.get("ItemTaxWithheldList") or []:
+				for tc in withheld_entry.get("TaxesWithheld") or []:
+					w_amt = flt((tc.get("ChargeAmount") or {}).get("CurrencyAmount") or (tc.get("ChargeAmount") or {}).get("Amount"))
+					if w_amt != 0:
+						deduction = -abs(w_amt)
+						charges.append(
+							{
+								"charge_type": "Actual",
+								"account_head": self.get_account("Tax"),
+								"tax_amount": deduction,
+								"description": f"TaxWithheld ({tc.get('ChargeType') or 'MFT'}) for {sku}",
+							}
+						)
 
 	def get_charges_and_fees(self, order_id, raw_items: list | None = None) -> dict:
 		finances = self.get_finances_instance()
@@ -261,6 +334,8 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				for shipment_item in shipment_event.get("ShipmentItemList", []):
 					charges = shipment_item.get("ItemChargeList", [])
 					fees = shipment_item.get("ItemFeeList", [])
+					promotions = shipment_item.get("PromotionList", [])
+					withheld_list = shipment_item.get("ItemTaxWithheldList", [])
 					seller_sku = shipment_item.get("SellerSKU") or shipment_item.get("ASIN") or "Order Item"
 
 					for charge in charges:
@@ -278,12 +353,42 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 								}
 							)
 
+					for promo in promotions:
+						promo_amt = flt((promo.get("PromotionAmount") or {}).get("CurrencyAmount"))
+						if promo_amt != 0:
+							charges_and_fees["charges"].append(
+								{
+									"charge_type": "Actual",
+									"account_head": self.get_account("PromotionDiscount"),
+									"tax_amount": -abs(promo_amt),
+									"description": f"PromotionDiscount for {seller_sku}",
+								}
+							)
+
+					for withheld_entry in withheld_list:
+						for tc in withheld_entry.get("TaxesWithheld") or []:
+							w_amt = flt((tc.get("ChargeAmount") or {}).get("CurrencyAmount"))
+							if w_amt != 0:
+								charges_and_fees["charges"].append(
+									{
+										"charge_type": "Actual",
+										"account_head": self.get_account("Tax"),
+										"tax_amount": -abs(w_amt),
+										"description": f"TaxWithheld ({tc.get('ChargeType') or 'MFT'}) for {seller_sku}",
+									}
+								)
+
 					for fee in fees:
 						fee_type = fee.get("FeeType")
 						amount = fee.get("FeeAmount", {}).get("CurrencyAmount", 0)
 
 						if flt(amount) != 0:
-							fee_account = self.get_account(fee_type)
+							fee_account = get_or_create_leaf_account(
+								self.amz_setting.company,
+								f"Amazon {fee_type}",
+								root_type="Expense",
+								account_type="",
+							)
 							charges_and_fees["fees"].append(
 								{
 									"charge_type": "Actual",
@@ -402,6 +507,7 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		final_order_items = []
 		target_warehouse = warehouse or self.amz_setting.warehouse
 		source_items = raw_items if raw_items is not None else self.get_raw_order_items(order_id)
+		include_taxes = bool(cint(self.amz_setting.get("taxes_charges")))
 
 		for order_item in source_items:
 			qty = flt(order_item.get("QuantityOrdered"))
@@ -409,6 +515,10 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				item_code = self.get_item_code(order_item)
 				stock_uom = frappe.db.get_value("Item", item_code, "stock_uom") or "Nos"
 				total_amount = flt((order_item.get("ItemPrice") or {}).get("Amount", 0))
+				if not include_taxes:
+					promo_discount = abs(flt((order_item.get("PromotionDiscount") or {}).get("Amount", 0)))
+					if promo_discount > 0 and total_amount >= promo_discount:
+						total_amount = flt(total_amount - promo_discount)
 				unit_rate = total_amount / qty
 				row = {
 					"item_code": item_code,
@@ -437,6 +547,8 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 			contact_first_name = buyer_info.get("BuyerName") or order_customer_name
 			existing_customer_name = frappe.db.get_value(
 				"Customer", filters={"name": order_customer_name}, fieldname="name"
+			) or frappe.db.get_value(
+				"Customer", filters={"customer_name": order_customer_name}, fieldname="name"
 			)
 
 			if existing_customer_name:
@@ -527,6 +639,32 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 			return so_name
 
 		if so_name:
+			existing_so_meta = frappe.db.get_value(
+				"Sales Order",
+				so_name,
+				["docstatus", "grand_total", "per_delivered", "per_billed", "amazon_order_status", "customer"],
+				as_dict=True,
+			)
+			# If a Sales Order was imported while Pending with 0.00 pricing and is now confirmed (Unshipped/Shipped),
+			# replace the 0-value placeholder order before invoicing/shipping.
+			if (
+				existing_so_meta
+				and existing_so_meta.docstatus != 2
+				and flt(existing_so_meta.grand_total) == 0
+				and flt(existing_so_meta.per_delivered) == 0
+				and flt(existing_so_meta.per_billed) == 0
+				and existing_so_meta.amazon_order_status in ("Pending", "PendingAvailability", None, "")
+				and order_status not in ("Pending", "PendingAvailability", "Canceled")
+			):
+				old_so = frappe.get_doc("Sales Order", so_name)
+				if old_so.docstatus == 1:
+					old_so.flags.from_amazon_sync = True
+					old_so.flags.ignore_permissions = True
+					old_so.cancel()
+				frappe.delete_doc("Sales Order", so_name, force=1, ignore_permissions=True)
+				so_name = None
+
+		if so_name:
 			so_updates = {}
 			if frappe.db.has_column("Sales Order", "amazon_order_status"):
 				so_updates["amazon_order_status"] = order_status
@@ -536,7 +674,10 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				so_updates["is_prime"] = is_prime
 			if so_updates:
 				frappe.db.set_value("Sales Order", so_name, so_updates, update_modified=False)
-			if cint(self.amz_setting.get("sync_sales_invoice")):
+			if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
+				"Pending",
+				"PendingAvailability",
+			):
 				create_sales_invoice_from_sales_order(self, so_name)
 			return so_name
 
@@ -587,6 +728,21 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		if target_warehouse and hasattr(so, "set_warehouse"):
 			so.set_warehouse = target_warehouse
 
+		order_currency = (order.get("OrderTotal") or {}).get("CurrencyCode")
+		if not order_currency and raw_items:
+			order_currency = ((raw_items[0].get("ItemPrice") or {}).get("CurrencyCode") or "").strip()
+		company_currency = frappe.db.get_value("Company", self.amz_setting.company, "default_currency")
+		if order_currency and company_currency and order_currency != company_currency:
+			if frappe.db.exists("Currency", order_currency):
+				so.currency = order_currency
+				try:
+					from erpnext.setup.utils import get_exchange_rate
+
+					ex_rate = flt(get_exchange_rate(order_currency, company_currency, transaction_date))
+				except Exception:
+					ex_rate = 0.0
+				so.conversion_rate = ex_rate if ex_rate > 0 else 1.0
+
 		for item in items:
 			so.append("items", item)
 
@@ -598,7 +754,10 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		so.insert(ignore_permissions=True)
 		so.submit()
 
-		if cint(self.amz_setting.get("sync_sales_invoice")):
+		if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
+			"Pending",
+			"PendingAvailability",
+		):
 			create_sales_invoice_from_sales_order(self, so.name)
 
 		return so.name
@@ -680,6 +839,7 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		from amazon_connector.amazon_ext.fulfillment import create_delivery_note_from_amazon_order
 
 		sales_orders = []
+		had_errors = False
 		import_dn = bool(cint(self.amz_setting.get("sync_delivery_notes")))
 		after = created_after if created_after is not None else self.amz_setting.after_date
 
@@ -691,6 +851,8 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		):
 			order_id = order.get("AmazonOrderId") or "Unknown"
 			frappe.db.savepoint("amazon_order_sync")
+			prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+			frappe.flags.in_amazon_sync_savepoint = True
 			try:
 				sales_order = self.create_sales_order(order)
 				if sales_order:
@@ -698,6 +860,7 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 					if import_dn and order.get("OrderStatus") in ("Shipped", "PartiallyShipped"):
 						create_delivery_note_from_amazon_order(self, order, sales_order)
 			except Exception as e:
+				had_errors = True
 				frappe.db.rollback(save_point="amazon_order_sync")
 				frappe.log_error(
 					message=frappe.get_traceback(),
@@ -713,22 +876,31 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 					},
 					message=f"Failed syncing Amazon Order {order_id}: {strip_html(str(e))}",
 					make_new=True,
+					commit=False,
 				)
+			finally:
+				frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 
-		update_setting_sync_timestamp(self.amz_setting, "last_orders_sync")
+		if not had_errors:
+			update_setting_sync_timestamp(self.amz_setting, "last_orders_sync")
 		return sales_orders
 
-	def get_delivery_notes(self, created_after=None) -> list:
+	def get_delivery_notes(self, created_after=None, last_updated_after=None) -> list:
 		from amazon_connector.amazon_ext.fulfillment import create_delivery_note_from_amazon_order
 
 		after = created_after or self.amz_setting.after_date
 		delivery_notes = []
+		had_errors = False
 
 		for order in self._iter_orders(
-			created_after=after, order_statuses=["Shipped", "PartiallyShipped"]
+			created_after=after if not last_updated_after else None,
+			last_updated_after=last_updated_after,
+			order_statuses=["Shipped", "PartiallyShipped"],
 		):
 			order_id = order.get("AmazonOrderId") or "Unknown"
 			frappe.db.savepoint("amazon_dn_sync")
+			prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+			frappe.flags.in_amazon_sync_savepoint = True
 			try:
 				sales_order = self.create_sales_order(order)
 				if not sales_order:
@@ -737,6 +909,7 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				if dn_name:
 					delivery_notes.append(dn_name)
 			except Exception as e:
+				had_errors = True
 				frappe.db.rollback(save_point="amazon_dn_sync")
 				frappe.log_error(
 					message=frappe.get_traceback(),
@@ -752,9 +925,13 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 					},
 					message=f"Failed syncing Delivery Note for Amazon Order {order_id}: {strip_html(str(e))}",
 					make_new=True,
+					commit=False,
 				)
+			finally:
+				frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 
-		update_setting_sync_timestamp(self.amz_setting, "last_delivery_notes_sync")
+		if not had_errors:
+			update_setting_sync_timestamp(self.amz_setting, "last_delivery_notes_sync")
 		return delivery_notes
 
 	def sync_single_order(
@@ -858,6 +1035,8 @@ def validate_amazon_sp_api_credentials(**args) -> None:
 	except SPAPIError as e:
 		msg = f"<b>Error:</b> {e.error}<br/><b>Error Description:</b> {e.error_description}"
 		frappe.throw(msg)
+	except Exception as e:
+		frappe.throw(f"<b>Error:</b> {e}")
 
 
 @frappe.whitelist()
@@ -868,9 +1047,9 @@ def get_orders(amz_setting_name, created_after=None, last_updated_after=None) ->
 	return ar.get_orders(created_after=created_after, last_updated_after=last_updated_after)
 
 
-def get_delivery_notes(amz_setting_name, created_after=None) -> list:
+def get_delivery_notes(amz_setting_name, created_after=None, last_updated_after=None) -> list:
 	ar = CustomAmazonRepository(amz_setting_name)
-	return ar.get_delivery_notes(created_after)
+	return ar.get_delivery_notes(created_after=created_after, last_updated_after=last_updated_after)
 
 
 def get_listings(amz_setting_name: str) -> dict:

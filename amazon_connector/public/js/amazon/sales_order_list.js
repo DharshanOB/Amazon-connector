@@ -17,6 +17,10 @@
 	let last_sync_time = 0;
 
 	function trigger_amazon_so_sync(listview) {
+		const route = frappe.get_route ? frappe.get_route() : null;
+		if (route && (route[0] !== "List" || route[1] !== "Sales Order")) {
+			return;
+		}
 		const now = Date.now();
 		if (is_syncing || now - last_sync_time < 3000) {
 			return;

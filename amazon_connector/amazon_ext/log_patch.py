@@ -23,8 +23,9 @@ def create_log(
 	commit=True,
 ):
 	make_new = make_new or not bool(frappe.flags.request_id)
+	in_savepoint = bool(getattr(frappe.flags, "in_amazon_sync_savepoint", False))
 
-	if rollback and not getattr(frappe.db, "_disable_transaction_control", 0):
+	if rollback and not in_savepoint and not getattr(frappe.db, "_disable_transaction_control", 0):
 		frappe.db.rollback()
 
 	if make_new:
@@ -50,7 +51,12 @@ def create_log(
 	log.status = status
 	log.save(ignore_permissions=True)
 
-	if commit and not frappe.flags.in_test and not getattr(frappe.db, "_disable_transaction_control", 0):
+	if (
+		commit
+		and not in_savepoint
+		and not frappe.flags.in_test
+		and not getattr(frappe.db, "_disable_transaction_control", 0)
+	):
 		frappe.db.commit()
 
 	return log

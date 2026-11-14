@@ -311,10 +311,15 @@ class SPAPI:
 
 		return result
 
-	def list_to_dict(self, key: str, values: list, data: dict) -> None:
-		if values and isinstance(values, list):
-			for idx, val in enumerate(values):
-				data[f"{key}[{idx}]"] = val
+	def list_to_dict(self, key: str, values: list | tuple | set | str | None, data: dict) -> None:
+		if not values:
+			return
+		if isinstance(values, (list, tuple, set)):
+			items = [str(v) for v in values if v is not None and str(v) != ""]
+			if items:
+				data[key] = ",".join(items)
+		else:
+			data[key] = str(values)
 
 
 class Tokens(SPAPI):
@@ -605,8 +610,18 @@ class Reports(SPAPI):
 		if not url:
 			raise SPAPIError(error="missing_report_url", error_description="Report document has no download URL.")
 
+		parsed = urlparse(str(url).strip())
+		hostname = (parsed.hostname or "").lower()
+		if parsed.scheme not in ("http", "https") or not hostname or hostname in {
+			"169.254.169.254",
+			"100.100.100.200",
+			"metadata.google.internal",
+			"fd00:ec2::254",
+		}:
+			raise SPAPIError(error="invalid_report_url", error_description="Invalid or disallowed report download URL.")
+
 		# Pre-signed S3/CloudFront URLs reject SP-API auth headers.
-		response = request(method="GET", url=url, timeout=60)
+		response = request(method="GET", url=url, timeout=DEFAULT_SPAPI_TIMEOUT)
 		if response.status_code >= 400:
 			raise SPAPIError(error=str(response.status_code), error_description=response.text)
 
@@ -666,7 +681,8 @@ class ListingsItems(SPAPI):
 
 		payload = dict(body or {})
 		if not payload.get("requirements"):
-			payload["requirements"] = "LISTING"
+			is_generic_product = str(payload.get("productType") or "").strip().upper() == "PRODUCT"
+			payload["requirements"] = "LISTING_OFFER_ONLY" if is_generic_product else "LISTING"
 
 		append_to_base_uri = f"/{quote(str(seller_id), safe='')}/{quote(str(sku), safe='')}"
 		return self.make_request(

@@ -42,6 +42,10 @@ def _make_mock_repo(amz_setting=None):
 		"country_code": "IN",
 		"use_sandbox": True,
 	}
+	repo.marketplace_id = "A21TJRUUN4KGV"
+	mock_inst = MagicMock()
+	mock_inst.marketplace_id = "A21TJRUUN4KGV"
+	repo.get_listings_items_instance.return_value = mock_inst
 	return repo
 
 
@@ -386,6 +390,533 @@ class TestAmazonOutbound(IntegrationTestCase):
 		self.assertFalse(
 			frappe.db.exists("Ecommerce Item", {"integration": "amazon", "erpnext_item_code": item.name})
 		)
+
+	def test_product_type_requirements_offer_only_vs_specific_listing(self):
+		item = _create_test_item("OB-PTYPE")
+		repo = _make_mock_repo(
+			frappe._dict(
+				name="AMZ-PTYPE",
+				seller_id="S-PTYPE",
+				client_id="C-PTYPE",
+				country="IN",
+				warehouse=self.warehouse,
+				price_list=self.price_list,
+			)
+		)
+		listings_client = MagicMock()
+		listings_client.put_listings_item.return_value = {"status": "ACCEPTED", "issues": []}
+		listings_client.marketplace_id = "A21TJRUUN4KGV"
+		repo.get_listings_items_instance.return_value = listings_client
+
+		pt_client = MagicMock()
+		pt_client.get_definitions_product_type.return_value = {"productType": "PRODUCT", "requirements": "LISTING_OFFER_ONLY"}
+		repo.get_product_type_definitions_instance.return_value = pt_client
+
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		outbound.create_or_update_listing(item.name, product_type="PRODUCT", price_override=199.0)
+		offer_body = listings_client.put_listings_item.call_args.kwargs["body"]
+		self.assertEqual(offer_body["requirements"], "LISTING_OFFER_ONLY")
+		self.assertIn("condition_type", offer_body["attributes"])
+		self.assertNotIn("item_name", offer_body["attributes"])
+
+		outbound.create_or_update_listing(item.name, product_type="HEADPHONES", price_override=199.0)
+		full_body = listings_client.put_listings_item.call_args.kwargs["body"]
+		self.assertEqual(full_body["requirements"], "LISTING")
+		self.assertIn("item_name", full_body["attributes"])
+		self.assertIn("brand", full_body["attributes"])
+
+		outbound.get_product_type_definition("PRODUCT")
+		self.assertEqual(
+			pt_client.get_definitions_product_type.call_args.kwargs["requirements"],
+			"LISTING_OFFER_ONLY",
+		)
+
+	def test_india_purchasable_offer_includes_audience_and_mrp_in_put_and_patch(self):
+		item = _create_test_item("OB-IN-MRP")
+		item.amazon_mrp = 799.0
+		item.save(ignore_permissions=True)
+
+		in_repo = _make_mock_repo(
+			frappe._dict(
+				name="AMZ-IN-MRP",
+				seller_id="S-IN",
+				client_id="C-IN",
+				country="IN",
+				warehouse=self.warehouse,
+				price_list=self.price_list,
+			)
+		)
+		listings_client = MagicMock()
+		listings_client.put_listings_item.return_value = {"status": "ACCEPTED", "issues": []}
+		listings_client.patch_listings_item.return_value = {"status": "ACCEPTED", "issues": []}
+		listings_client.marketplace_id = "A21TJRUUN4KGV"
+		in_repo.get_listings_items_instance.return_value = listings_client
+
+		outbound_in = amazon_outbound.AmazonOutboundSync(in_repo)
+		outbound_in.create_or_update_listing(item.name, product_type="HEADPHONES", price_override=599.0)
+		put_offer = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]["purchasable_offer"][0]
+		self.assertEqual(put_offer["audience"], "ALL")
+		self.assertEqual(put_offer["currency"], "INR")
+		self.assertEqual(put_offer["our_price"][0]["schedule"][0]["value_with_tax"], 599.0)
+		self.assertEqual(put_offer["maximum_retail_price"][0]["schedule"][0]["value_with_tax"], 799.0)
+
+		outbound_in.update_stock_and_price(item.name, stock_qty=10, price=549.0)
+		patches = listings_client.patch_listings_item.call_args.kwargs["body"]["patches"]
+		offer_patch = next(p for p in patches if p["path"] == "/attributes/purchasable_offer")
+		self.assertEqual(offer_patch["value"][0]["audience"], "ALL")
+		self.assertEqual(offer_patch["value"][0]["maximum_retail_price"][0]["schedule"][0]["value_with_tax"], 799.0)
+
+		# Fallback to selling price when amazon_mrp is zero
+		item.amazon_mrp = 0
+		item.save(ignore_permissions=True)
+		outbound_in.create_or_update_listing(item.name, product_type="PRODUCT", price_override=499.0)
+		fb_offer = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]["purchasable_offer"][0]
+		self.assertEqual(fb_offer["maximum_retail_price"][0]["schedule"][0]["value_with_tax"], 499.0)
+
+		# Non-India marketplaces should omit maximum_retail_price
+		us_pl = frappe.db.get_value("Price List", {"selling": 1, "currency": "USD"}, "name")
+		us_repo = _make_mock_repo(
+			frappe._dict(
+				name="AMZ-US",
+				seller_id="S-US",
+				client_id="C-US",
+				country="US",
+				warehouse=self.warehouse,
+				price_list=us_pl,
+			)
+		)
+		us_repo.get_listings_items_instance.return_value = listings_client
+		outbound_us = amazon_outbound.AmazonOutboundSync(us_repo)
+		with patch.object(outbound_us, "get_currency", return_value="USD"):
+			outbound_us.create_or_update_listing(item.name, product_type="PRODUCT", price_override=29.0)
+		us_offer = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]["purchasable_offer"][0]
+		self.assertEqual(us_offer["audience"], "ALL")
+		self.assertEqual(us_offer["currency"], "USD")
+		self.assertNotIn("maximum_retail_price", us_offer)
+
+	def test_compliance_defaults_and_standard_item_field_mappings(self):
+		if not frappe.db.exists("Customs Tariff Number", "85183000"):
+			frappe.get_doc({"doctype": "Customs Tariff Number", "tariff_number": "85183000"}).insert(
+				ignore_permissions=True
+			)
+		if not frappe.db.exists("UOM", "Kg"):
+			frappe.get_doc({"doctype": "UOM", "uom_name": "Kg"}).insert(ignore_permissions=True)
+		if not frappe.db.exists("Manufacturer", "Acme Mfg"):
+			frappe.get_doc({"doctype": "Manufacturer", "short_name": "Acme Mfg"}).insert(ignore_permissions=True)
+		if not frappe.db.exists("Amazon Product Type", "HEADPHONES"):
+			frappe.get_doc({
+				"doctype": "Amazon Product Type",
+				"product_type": "HEADPHONES",
+				"display_name": "Headphones",
+				"marketplace_id": "A21TJRUUN4KGV",
+			}).insert(ignore_permissions=True)
+
+		item = _create_test_item("OB-COMPLY")
+		item.country_of_origin = "India"
+		item.customs_tariff_number = "85183000"
+		item.weight_per_unit = 0.25
+		item.weight_uom = "Kg"
+		item.warranty_period = "365"
+		item.default_item_manufacturer = "Acme Mfg"
+		item.amazon_asin = "b09test123"
+		item.amazon_product_type = "HEADPHONES"
+		item.save(ignore_permissions=True)
+
+		setting = frappe._dict(
+			name="AMZ-IN-COMPLY",
+			seller_id="S-IN",
+			client_id="C-IN",
+			country="IN",
+			warehouse=self.warehouse,
+			price_list=self.price_list,
+			default_country_of_origin="India",
+			default_dg_regulation="not_applicable",
+			packer_contact_info="Acme Pack, Bengaluru 560001",
+			importer_contact_info="Acme Imp, Mumbai 400001",
+			manufacturer_contact_info="support@acme.example",
+		)
+		repo = _make_mock_repo(setting)
+		listings_client = MagicMock()
+		listings_client.put_listings_item.return_value = {"status": "ACCEPTED", "issues": []}
+		listings_client.marketplace_id = "A21TJRUUN4KGV"
+		repo.get_listings_items_instance.return_value = listings_client
+
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		outbound.create_or_update_listing(item.name, price_override=999.0)
+		attrs = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]
+
+		self.assertEqual(attrs["country_of_origin"], [{"value": "IN", "marketplace_id": "A21TJRUUN4KGV"}])
+		self.assertEqual(
+			attrs["external_product_information"],
+			[{"entity": "HSN Code", "value": "85183000", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["item_weight"],
+			[{"unit": "kilograms", "value": 0.25, "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["warranty_description"],
+			[{"language_tag": "en_IN", "value": "365 days manufacturer warranty", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["merchant_suggested_asin"],
+			[{"value": "B09TEST123", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["supplier_declared_dg_hz_regulation"],
+			[{"value": "not_applicable", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["packer_contact_information"],
+			[{"language_tag": "en_IN", "value": "Acme Pack, Bengaluru 560001", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["importer_contact_information"],
+			[{"language_tag": "en_IN", "value": "Acme Imp, Mumbai 400001", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+		self.assertEqual(
+			attrs["rtip_manufacturer_contact_information"],
+			[{"value": "support@acme.example"}],
+		)
+		self.assertEqual(
+			attrs["manufacturer"],
+			[{"language_tag": "en_IN", "value": "Acme Mfg", "marketplace_id": "A21TJRUUN4KGV"}],
+		)
+
+		# Fallback country_of_origin from Settings and ASIN from Ecommerce Item when Item fields are blank;
+		# LISTING_OFFER_ONLY omits warranty_description while retaining compliance attributes.
+		item_fb = _create_test_item("OB-FB")
+		item_fb.country_of_origin = ""
+		item_fb.customs_tariff_number = "85183000"
+		item_fb.warranty_period = "180"
+		item_fb.save(ignore_permissions=True)
+		ecom = _create_ecommerce_item_mapping(item_fb.name, sku="SKU-FB-ONLY")
+		frappe.db.set_value("Ecommerce Item", ecom.name, "integration_item_code", "B08FALLBK1")
+
+		outbound.create_or_update_listing(item_fb.name, product_type="PRODUCT", price_override=499.0)
+		fb_attrs = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]
+		self.assertEqual(fb_attrs["country_of_origin"][0]["value"], "IN")
+		self.assertEqual(fb_attrs["merchant_suggested_asin"][0]["value"], "B08FALLBK1")
+		self.assertIn("external_product_information", fb_attrs)
+		self.assertNotIn("warranty_description", fb_attrs)
+
+	def test_amazon_attributes_json_override_normalization_and_validation(self):
+		item = _create_test_item("OB-JSON")
+		item.amazon_product_type = "HEADPHONES"
+		item.country_of_origin = "India"
+		item.amazon_attributes = (
+			'{"color": "Matte Black", '
+			'"bullet_point": ["ANC 30dB", {"language_tag": "en_IN", "value": "30h battery"}], '
+			'"model_number": {"value": "BUDS-PRO-1"}, '
+			'"country_of_origin": "VN"}'
+		)
+		item.save(ignore_permissions=True)
+
+		repo = _make_mock_repo()
+		listings_client = MagicMock()
+		listings_client.put_listings_item.return_value = {"status": "ACCEPTED", "issues": []}
+		listings_client.marketplace_id = "A21TJRUUN4KGV"
+		repo.get_listings_items_instance.return_value = listings_client
+
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		outbound.create_or_update_listing(item.name, price_override=1299.0)
+		attrs = listings_client.put_listings_item.call_args.kwargs["body"]["attributes"]
+
+		self.assertEqual(attrs["color"], [{"value": "Matte Black", "marketplace_id": "A21TJRUUN4KGV"}])
+		self.assertEqual(
+			attrs["bullet_point"],
+			[
+				{"value": "ANC 30dB", "marketplace_id": "A21TJRUUN4KGV"},
+				{"language_tag": "en_IN", "value": "30h battery", "marketplace_id": "A21TJRUUN4KGV"},
+			],
+		)
+		self.assertEqual(attrs["model_number"], [{"value": "BUDS-PRO-1", "marketplace_id": "A21TJRUUN4KGV"}])
+		self.assertEqual(attrs["country_of_origin"], [{"value": "VN", "marketplace_id": "A21TJRUUN4KGV"}])
+
+		item.amazon_attributes = "{bad-json"
+		item.flags.from_integration = True
+		item.save(ignore_permissions=True)
+		with self.assertRaises(frappe.ValidationError):
+			outbound.create_or_update_listing(item.name, price_override=1299.0)
+
+	def test_amazon_product_type_custom_query_and_sync(self):
+		from amazon_connector.amazon_connector.doctype.amazon_product_type.amazon_product_type import (
+			get_product_types_list,
+		)
+
+		if not frappe.db.exists("Amazon Product Type", "TEST_HEADPHONES"):
+			frappe.get_doc({
+				"doctype": "Amazon Product Type",
+				"product_type": "TEST_HEADPHONES",
+				"display_name": "Test Wireless Headphones",
+				"marketplace_id": "A21TJRUUN4KGV",
+			}).insert(ignore_permissions=True)
+
+		results = get_product_types_list("Amazon Product Type", "wireless", "name", 0, 10, {})
+		found = [r for r in results if r[0] == "TEST_HEADPHONES"]
+		self.assertTrue(found, "Custom query should find TEST_HEADPHONES by display name keyword 'wireless'")
+		self.assertIn("Test Wireless Headphones (TEST_HEADPHONES)", found[0][1])
+
+		repo = _make_mock_repo()
+		ptd = MagicMock()
+		ptd.make_request.return_value = {
+			"productTypes": [
+				{"name": "SYNC_TEST_PT", "displayName": "Sync Test Category"}
+			]
+		}
+		repo.get_product_type_definitions_instance.return_value = ptd
+
+		with patch("amazon_connector.amazon_ext.repository.CustomAmazonRepository", return_value=repo):
+			res = amazon_outbound.sync_amazon_product_types(amz_setting_name="AMZ-MOCK-001")
+			self.assertGreaterEqual(res.get("synced", 0), 1)
+			self.assertTrue(frappe.db.exists("Amazon Product Type", "SYNC_TEST_PT"))
+
+	def test_build_attributes_template_and_category_whitelisted_api(self):
+		repo = _make_mock_repo()
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		mock_defn = {
+			"productType": "HEADPHONES",
+			"schemaLink": None,
+			"raw": {
+				"schema": {
+					"required": ["brand", "item_name", "color", "model_name"],
+					"properties": {
+						"color": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"language_tag": {"type": "string"},
+									"value": {"type": "string", "examples": ["Matte Black"]},
+								},
+							},
+						},
+						"model_name": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"language_tag": {"type": "string"},
+									"value": {"type": "string", "examples": ["Buds Pro"]},
+								},
+							},
+						},
+						"unit_count": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {"value": {"type": "number"}, "type": {"type": "object"}},
+							},
+						},
+						"item_dimensions": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"length": {"type": "object"},
+									"width": {"type": "object"},
+									"height": {"type": "object"},
+								},
+							},
+						},
+					},
+				}
+			},
+		}
+		with patch.object(outbound, "get_product_type_definition", return_value=mock_defn):
+			tmpl = outbound.build_attributes_template("HEADPHONES")
+			self.assertIn("color", tmpl)
+			self.assertEqual(tmpl["color"], {"language_tag": "en_IN", "value": "Matte Black"})
+			self.assertIn("model_name", tmpl)
+			self.assertIn("unit_count", tmpl)
+			self.assertIn("item_dimensions", tmpl)
+
+		with patch("amazon_connector.amazon_ext.repository.CustomAmazonRepository", return_value=repo):
+			with patch.object(amazon_outbound.AmazonOutboundSync, "build_attributes_template", return_value={"color": "Black"}):
+				api_res = amazon_outbound.get_category_attributes_template("HEADPHONES", amz_setting_name="AMZ-MOCK-001")
+				self.assertEqual(api_res["product_type"], "HEADPHONES")
+				self.assertEqual(api_res["template"], {"color": "Black"})
+				self.assertIn('"color": "Black"', api_res["json"])
+
+	def test_item_group_amazon_product_type_and_template_custom_fields(self):
+		if not frappe.db.exists("Amazon Product Type", "HEADPHONES"):
+			frappe.get_doc({
+				"doctype": "Amazon Product Type",
+				"product_type": "HEADPHONES",
+				"display_name": "Headphones",
+				"marketplace_id": "A21TJRUUN4KGV",
+			}).insert(ignore_permissions=True)
+
+		ig_name = _uid("IG-AMZ")
+		ig = frappe.get_doc({
+			"doctype": "Item Group",
+			"item_group_name": ig_name,
+			"parent_item_group": "All Item Groups",
+			"amazon_product_type": "HEADPHONES",
+			"amazon_attributes_template": '{"color": "Obsidian Black"}',
+		}).insert(ignore_permissions=True)
+
+		self.assertEqual(frappe.db.get_value("Item Group", ig.name, "amazon_product_type"), "HEADPHONES")
+		self.assertIn("Obsidian Black", frappe.db.get_value("Item Group", ig.name, "amazon_attributes_template"))
+		frappe.delete_doc("Item Group", ig.name, force=1)
+
+	def test_variant_item_inherits_product_type_and_maps_variant_attributes(self):
+		repo = _make_mock_repo()
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+
+		# 1. Product type inheritance from template
+		template_item = frappe._dict(name="ITEM-TMPL", amazon_product_type="HEADPHONES")
+		variant_item = frappe._dict(
+			name="ITEM-VAR-1",
+			variant_of="ITEM-TMPL",
+			amazon_product_type=None,
+			attributes=[
+				frappe._dict(attribute="Colour", attribute_value="Midnight Blue"),
+				frappe._dict(attribute="Size", attribute_value="Medium"),
+			],
+		)
+		with patch.object(frappe.db, "get_value", return_value="HEADPHONES"):
+			pt = outbound.get_product_type(variant_item)
+			self.assertEqual(pt, "HEADPHONES")
+
+		# 2. Variant attributes mapping with aliases (Colour -> color)
+		attrs = outbound.build_listing_attributes(
+			item=variant_item,
+			item_code="ITEM-VAR-1",
+			sku="SKU-VAR-1",
+			product_type="HEADPHONES",
+			stock_qty=10,
+			price=1499.0,
+			currency="INR",
+			marketplace_id="A21TJRUUN4KGV",
+			barcodes=[],
+		)
+		self.assertIn("color", attrs)
+		self.assertEqual(attrs["color"][0]["value"], "Midnight Blue")
+		self.assertIn("size", attrs)
+		self.assertEqual(attrs["size"][0]["value"], "Medium")
+
+		# 3. Metadata extraction with strict fieldtypes & structured widgets
+		meta = outbound.build_attributes_metadata(
+			"HEADPHONES",
+			tmpl={
+				"color": {"language_tag": "en_IN", "value": "Blue"},
+				"item_type_name": {"language_tag": "en_IN", "value": "Headphones"},
+				"batteries_required": False,
+				"publication_date": "2024-01-01",
+				"bullet_point": [{"language_tag": "en_IN", "value": "ANC"}],
+				"item_dimensions": {"length": {"unit": "centimeters", "value": 10.0}},
+				"unit_count": {"value": 1, "type": {"language_tag": "en_IN", "value": "count"}},
+			},
+		)
+		field_map = {m["fieldname"]: m for m in meta}
+		self.assertEqual(field_map["color"]["fieldtype"], "Data")
+		self.assertEqual(field_map["item_type_name"]["fieldtype"], "Data")
+		self.assertEqual(field_map["batteries_required"]["fieldtype"], "Check")
+		self.assertEqual(field_map["publication_date"]["fieldtype"], "Date")
+		self.assertEqual(field_map["bullet_point"]["widget_type"], "bullet_list")
+		self.assertEqual(field_map["bullet_point"]["placeholder"], "ANC")
+		self.assertEqual(field_map["item_dimensions"]["widget_type"], "dimensions")
+		self.assertEqual(field_map["unit_count"]["widget_type"], "unit_count")
+
+	def test_seed_default_item_attributes_is_idempotent(self):
+		from amazon_connector.setup_fixtures import DEFAULT_ITEM_ATTRIBUTES, _seed_default_item_attributes
+
+		# Ensure custom existing attribute is never overwritten by seeding
+		if not frappe.db.exists("Item Attribute", "Color"):
+			frappe.get_doc({
+				"doctype": "Item Attribute",
+				"attribute_name": "Color",
+				"numeric_values": 0,
+				"item_attribute_values": [{"attribute_value": "Custom Crimson", "abbr": "CCRM"}],
+			}).insert(ignore_permissions=True)
+
+		color_before = [
+			(r.attribute_value, r.abbr)
+			for r in frappe.get_doc("Item Attribute", "Color").item_attribute_values
+		]
+
+		_seed_default_item_attributes()
+
+		for attr_def in DEFAULT_ITEM_ATTRIBUTES:
+			self.assertTrue(
+				frappe.db.exists("Item Attribute", attr_def["attribute_name"]),
+				f"Expected Item Attribute {attr_def['attribute_name']} to be seeded",
+			)
+
+		color_after = [
+			(r.attribute_value, r.abbr)
+			for r in frappe.get_doc("Item Attribute", "Color").item_attribute_values
+		]
+		self.assertEqual(color_before, color_after)
+
+	def test_attribute_inheritance_hierarchy_item_group_template_variant(self):
+		if not frappe.db.exists("Amazon Product Type", "HEADPHONES"):
+			frappe.get_doc({
+				"doctype": "Amazon Product Type",
+				"product_type": "HEADPHONES",
+				"display_name": "Headphones",
+				"marketplace_id": "A21TJRUUN4KGV",
+			}).insert(ignore_permissions=True)
+
+		ig_name = _uid("IG-INH")
+		ig = frappe.get_doc({
+			"doctype": "Item Group",
+			"item_group_name": ig_name,
+			"parent_item_group": "All Item Groups",
+			"amazon_product_type": "HEADPHONES",
+			"amazon_attributes_template": '{"product_tax_code": "A_GEN_NOTAX", "model_name": "IG-Default", "color": "Grey"}',
+		}).insert(ignore_permissions=True)
+
+		tmpl_item = _create_test_item("TMPL-INH")
+		tmpl_item.item_group = ig.name
+		tmpl_item.amazon_product_type = "HEADPHONES"
+		tmpl_item.amazon_attributes = '{"model_name": "Buds X1", "color": "Black", "batteries_required": false}'
+		tmpl_item.save(ignore_permissions=True)
+
+		# Variant has copied template attributes (including color: Black) plus its own Variant Attributes row
+		variant_item = frappe._dict(
+			name=_uid("VAR-INH"),
+			item_code=_uid("VAR-INH"),
+			item_name="Buds X1 Midnight Blue",
+			item_group=ig.name,
+			variant_of=tmpl_item.name,
+			amazon_product_type=None,
+			amazon_attributes='{"color": "Black", "warranty_description": "1 Year"}',
+			attributes=[
+				frappe._dict(attribute="Colour", attribute_value="Midnight Blue"),
+				frappe._dict(attribute="Storage Capacity", attribute_value="128 GB"),
+				frappe._dict(attribute="Pack Size", attribute_value="2"),
+			],
+		)
+
+		repo = _make_mock_repo()
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		attrs = outbound.build_listing_attributes(
+			item=variant_item,
+			item_code=variant_item.item_code,
+			sku=variant_item.item_code,
+			product_type="HEADPHONES",
+			stock_qty=5,
+			price=1999.0,
+			currency="INR",
+			marketplace_id="A21TJRUUN4KGV",
+			barcodes=[],
+		)
+
+		# Inherited from Item Group
+		self.assertEqual(attrs["product_tax_code"][0]["value"], "A_GEN_NOTAX")
+		# Inherited from Template (overriding Item Group)
+		self.assertEqual(attrs["model_name"][0]["value"], "Buds X1")
+		self.assertEqual(attrs["batteries_required"][0]["value"], False)
+		# Item-level override
+		self.assertEqual(attrs["warranty_description"][0]["value"], "1 Year")
+		# Variant Attributes tab overrides copied/template color & maps expanded aliases
+		self.assertEqual(attrs["color"][0]["value"], "Midnight Blue")
+		self.assertEqual(attrs["memory_storage_capacity"][0]["value"], "128 GB")
+		self.assertEqual(attrs["number_of_items"][0]["value"], 2)
+
+		frappe.delete_doc("Item Group", ig.name, force=1)
 
 
 class TestAmazonFulfillment(IntegrationTestCase):

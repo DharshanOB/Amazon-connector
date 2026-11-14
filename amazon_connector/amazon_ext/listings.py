@@ -42,6 +42,8 @@ class AmazonListingSync:
 		for listing in listings:
 			identifier = listing.get("ASIN") or listing.get("SellerSKU") or "Unknown"
 			frappe.db.savepoint("amazon_listing_sync")
+			prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+			frappe.flags.in_amazon_sync_savepoint = True
 			try:
 				status, item_code = self.sync_listing(listing)
 				if status == "created":
@@ -57,6 +59,8 @@ class AmazonListingSync:
 					message=frappe.get_traceback(),
 					title=f"Amazon Listing Sync failed for {identifier}",
 				)
+			finally:
+				frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 
 		summary = {
 			"total": len(listings),
@@ -67,7 +71,7 @@ class AmazonListingSync:
 			"errors": errors,
 		}
 		setting_name = getattr(self.amz_setting, "name", None)
-		if setting_name and frappe.db.exists("Amazon SP API Settings", setting_name):
+		if not failed and setting_name and frappe.db.exists("Amazon SP API Settings", setting_name):
 			frappe.db.set_value(
 				"Amazon SP API Settings", setting_name, "last_listings_sync", now(), update_modified=False
 			)
@@ -86,43 +90,49 @@ class AmazonListingSync:
 		return parse_listings_tsv(report_text)
 
 	def sync_listing(self, listing: dict) -> tuple[str, str]:
-		catalog = self._fetch_catalog_details(listing.get("ASIN"))
-		enriched = dict(listing)
-		enriched["Title"] = (
-			enriched.get("Title")
-			or catalog.get("title")
-			or enriched.get("SellerSKU")
-			or enriched.get("ASIN")
-		)
-		enriched["Description"] = enriched.get("Description") or enriched["Title"]
-		price = enriched.get("Price") if enriched.get("Price") is not None else catalog.get("list_price")
-
-		existing_item_code = self._find_existing_item(enriched)
-
-		if existing_item_code:
-			status = "updated"
-			item_code = existing_item_code
-			self._update_erpnext_item(item_code, enriched, catalog)
-		else:
-			status = "created"
-			item_code = self._create_erpnext_item(enriched, catalog)
-
-		if price is not None and flt(price) > 0:
-			upsert_item_price(item_code, self.amz_setting.price_list, flt(price))
-
-		if cint(self.amz_setting.get("import_opening_stock", 1)) and flt(enriched.get("Quantity")) > 0:
-			self._ensure_opening_stock(
-				item_code=item_code,
-				qty=flt(enriched.get("Quantity")),
-				valuation_rate=flt(price) or flt(catalog.get("list_price")),
+		prev_listing_flag = getattr(frappe.flags, "in_amazon_listing_sync", False)
+		frappe.flags.in_amazon_listing_sync = True
+		try:
+			catalog = self._fetch_catalog_details(listing.get("ASIN"))
+			enriched = dict(listing)
+			enriched["Title"] = (
+				enriched.get("Title")
+				or catalog.get("title")
+				or enriched.get("SellerSKU")
+				or enriched.get("ASIN")
 			)
+			enriched["Description"] = enriched.get("Description") or enriched["Title"]
+			price = enriched.get("Price") if enriched.get("Price") is not None else catalog.get("list_price")
 
-		ensure_ecommerce_item(
-			integration_item_code=enriched.get("ASIN") or enriched.get("SellerSKU"),
-			item_code=item_code,
-			sku=enriched.get("SellerSKU"),
-		)
-		return status, item_code
+			existing_item_code = self._find_existing_item(enriched)
+
+			if existing_item_code:
+				status = "updated"
+				item_code = existing_item_code
+				self._update_erpnext_item(item_code, enriched, catalog)
+			else:
+				status = "created"
+				item_code = self._create_erpnext_item(enriched, catalog)
+
+			if price is not None and flt(price) > 0:
+				upsert_item_price(item_code, self.amz_setting.price_list, flt(price))
+
+			if cint(self.amz_setting.get("import_opening_stock", 1)) and flt(enriched.get("Quantity")) > 0:
+				self._ensure_opening_stock(
+					item_code=item_code,
+					qty=flt(enriched.get("Quantity")),
+					valuation_rate=0.0,
+					fulfillment_channel=enriched.get("FulfillmentChannel"),
+				)
+
+			ensure_ecommerce_item(
+				integration_item_code=enriched.get("ASIN") or enriched.get("SellerSKU"),
+				item_code=item_code,
+				sku=enriched.get("SellerSKU"),
+			)
+			return status, item_code
+		finally:
+			frappe.flags.in_amazon_listing_sync = prev_listing_flag
 
 	def _find_existing_item(self, enriched: dict) -> str | None:
 		lookup_field, lookup_value = get_item_lookup(self.amz_setting.amazon_fields_map, enriched)
@@ -191,13 +201,24 @@ class AmazonListingSync:
 			item.flags.from_integration = True
 			item.save(ignore_permissions=True)
 
-	def _ensure_opening_stock(self, item_code: str, qty: float, valuation_rate: float) -> str | None:
-		if flt(qty) <= 0 or not self.amz_setting.warehouse:
+	def _ensure_opening_stock(
+		self,
+		item_code: str,
+		qty: float,
+		valuation_rate: float = 0.0,
+		fulfillment_channel: str | None = None,
+	) -> str | None:
+		configured_wh = (
+			(self.amz_setting.get("fba_warehouse") or self.amz_setting.warehouse)
+			if fulfillment_channel == "AFN"
+			else self.amz_setting.warehouse
+		)
+		if flt(qty) <= 0 or not configured_wh:
 			return None
 		if not cint(frappe.db.get_value("Item", item_code, "is_stock_item")):
 			return None
 
-		target_warehouse = _resolve_target_warehouse(self.amz_setting.warehouse)
+		target_warehouse = _resolve_target_warehouse(configured_wh)
 		if not target_warehouse:
 			return None
 
@@ -210,14 +231,16 @@ class AmazonListingSync:
 		if current_qty > 0:
 			return None
 
+		# Only use true cost (explicit cost valuation_rate, Item.valuation_rate, or Buying Item Price).
+		# Never use the retail selling price as inventory cost valuation.
 		rate = flt(valuation_rate)
 		if rate <= 0:
 			rate = flt(frappe.db.get_value("Item", item_code, "valuation_rate"))
-		if rate <= 0 and self.amz_setting.price_list:
+		if rate <= 0:
 			rate = flt(
 				frappe.db.get_value(
 					"Item Price",
-					{"item_code": item_code, "price_list": self.amz_setting.price_list},
+					{"item_code": item_code, "buying": 1},
 					"price_list_rate",
 				)
 			)
@@ -383,6 +406,10 @@ def parse_listings_tsv(report_text: str) -> list[dict]:
 
 		raw_price = (row.get("price") or "").strip()
 		raw_qty = (row.get("quantity") or "").strip()
+		raw_fc = (row.get("fulfillment-channel") or "").strip().upper()
+		fulfillment_channel = (
+			"AFN" if (raw_fc.startswith("AMAZON") or raw_fc == "AFN") else "MFN"
+		)
 		listings.append(
 			{
 				"ASIN": asin,
@@ -392,6 +419,7 @@ def parse_listings_tsv(report_text: str) -> list[dict]:
 				"Price": flt(raw_price) if raw_price else None,
 				"Quantity": flt(raw_qty) if raw_qty else 0.0,
 				"ListingId": (row.get("listing-id") or "").strip(),
+				"FulfillmentChannel": fulfillment_channel,
 			}
 		)
 	return listings
@@ -550,14 +578,23 @@ def _resolve_target_warehouse(warehouse: str) -> str | None:
 
 def upsert_item_price(item_code: str, price_list: str, rate: float) -> None:
 	rate = flt(rate)
-	existing_name = frappe.db.get_value(
+	candidates = frappe.get_all(
 		"Item Price",
-		filters={"item_code": item_code, "price_list": price_list},
-		fieldname="name",
+		filters={"item_code": item_code, "price_list": price_list, "selling": 1},
+		fields=["name", "customer", "batch_no", "packing_unit"],
+		order_by="modified desc",
+	)
+	existing_name = next(
+		(
+			r.name
+			for r in candidates
+			if not r.get("customer") and not r.get("batch_no") and flt(r.get("packing_unit")) <= 1.0
+		),
+		None,
 	)
 	if existing_name:
 		if rate > 0:
-			frappe.db.set_value("Item Price", existing_name, "price_list_rate", rate)
+			frappe.db.set_value("Item Price", existing_name, "price_list_rate", rate, update_modified=False)
 		return
 
 	if rate <= 0:
@@ -567,6 +604,8 @@ def upsert_item_price(item_code: str, price_list: str, rate: float) -> None:
 	item_price.price_list = price_list
 	item_price.price_list_rate = rate
 	item_price.item_code = item_code
+	item_price.selling = 1
+	item_price.flags.from_amazon_sync = True
 	item_price.insert(ignore_permissions=True)
 
 

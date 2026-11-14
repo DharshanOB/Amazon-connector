@@ -120,10 +120,31 @@ def get_or_create_leaf_account(
 	preferred_parent: str | None = None,
 ) -> str:
 	existing = frappe.db.get_value(
-		"Account", {"account_name": account_name, "company": company, "is_group": 0}, "name"
+		"Account",
+		{"account_name": account_name, "company": company, "is_group": 0, "root_type": root_type},
+		"name",
 	)
 	if existing:
-		return existing
+		if account_type not in ("Receivable", "Payable"):
+			existing_type = frappe.db.get_value("Account", existing, "account_type")
+			if existing_type not in ("Receivable", "Payable"):
+				return existing
+		else:
+			return existing
+
+	target_account_name = account_name
+	conflicting = frappe.db.get_value(
+		"Account", {"account_name": account_name, "company": company}, ["name", "root_type", "is_group"], as_dict=True
+	)
+	if conflicting and (conflicting.root_type != root_type or cint(conflicting.is_group)):
+		target_account_name = f"{account_name} ({root_type})"
+		existing_qualified = frappe.db.get_value(
+			"Account",
+			{"account_name": target_account_name, "company": company, "is_group": 0, "root_type": root_type},
+			"name",
+		)
+		if existing_qualified:
+			return existing_qualified
 
 	parent_account = _find_parent_account_group(company, root_type, preferred_parent=preferred_parent)
 	if not parent_account:
@@ -132,7 +153,7 @@ def get_or_create_leaf_account(
 		)
 
 	acc = frappe.new_doc("Account")
-	acc.account_name = account_name
+	acc.account_name = target_account_name
 	acc.company = company
 	acc.parent_account = parent_account
 	acc.root_type = root_type
@@ -331,6 +352,51 @@ def _build_return_id(refund_event: dict) -> str:
 	return raw[:140]
 
 
+def _resolve_erpnext_item_code_for_sku(repo, sku: str | None) -> str | None:
+	if not sku:
+		return None
+	mapped = (
+		frappe.db.get_value(
+			"Ecommerce Item", {"integration": AMAZON_MODULE_DEF, "sku": sku}, "erpnext_item_code"
+		)
+		or frappe.db.get_value(
+			"Ecommerce Item",
+			{"integration": AMAZON_MODULE_DEF, "integration_item_code": sku},
+			"erpnext_item_code",
+		)
+	)
+	if mapped:
+		return mapped
+	if hasattr(repo, "get_item_code"):
+		try:
+			resolved = repo.get_item_code({"SellerSKU": sku, "ASIN": sku})
+			if resolved:
+				return resolved
+		except Exception:
+			pass
+	return sku
+
+
+def _get_already_returned_dn_qtys(submitted_dn: str) -> dict[str, float]:
+	returned_dns = frappe.get_all(
+		"Delivery Note",
+		filters={"return_against": submitted_dn, "is_return": 1, "docstatus": ["!=", 2]},
+		pluck="name",
+	)
+	if not returned_dns:
+		return {}
+	rows = frappe.get_all(
+		"Delivery Note Item",
+		filters={"parent": ["in", returned_dns]},
+		fields=["item_code", "qty"],
+	)
+	returned_by_item: dict[str, float] = {}
+	for r in rows:
+		if r.item_code:
+			returned_by_item[r.item_code] = returned_by_item.get(r.item_code, 0.0) + abs(flt(r.qty))
+	return returned_by_item
+
+
 def _maybe_create_return_delivery_note(repo, order_id: str, sku_qtys: dict[str, float], posting_date: str) -> str | None:
 	from erpnext.stock.doctype.delivery_note.delivery_note import make_sales_return as make_dn_return
 
@@ -343,21 +409,26 @@ def _maybe_create_return_delivery_note(repo, order_id: str, sku_qtys: dict[str, 
 	if not submitted_dn:
 		return None
 
-	already_returned = frappe.db.exists(
-		"Delivery Note",
-		{"return_against": submitted_dn, "is_return": 1, "docstatus": ["!=", 2]},
-	)
-	if already_returned:
+	already_returned_by_item = _get_already_returned_dn_qtys(submitted_dn)
+	if already_returned_by_item and not sku_qtys:
 		return None
 
 	dn_return = make_dn_return(submitted_dn)
 	filtered_items = []
 	for row in dn_return.items:
+		already_ret = already_returned_by_item.get(row.item_code, 0.0)
+		remaining_returnable = max(0.0, abs(flt(row.qty)) - already_ret)
+		if remaining_returnable <= 0:
+			continue
+
 		target_qty = sku_qtys.get(row.item_code) or sku_qtys.get(row.item_name)
 		if target_qty is not None and target_qty > 0:
-			row.qty = -min(abs(flt(row.qty)), flt(target_qty))
-			filtered_items.append(row)
+			return_qty = min(remaining_returnable, flt(target_qty))
+			if return_qty > 0:
+				row.qty = -return_qty
+				filtered_items.append(row)
 		elif not sku_qtys:
+			row.qty = -remaining_returnable
 			filtered_items.append(row)
 
 	if not filtered_items:
@@ -416,33 +487,50 @@ def _create_credit_note_from_refund(repo, refund_event: dict) -> str | None:
 	original_si = frappe.get_doc("Sales Invoice", original_si_name)
 	adj_items = refund_event.get("ShipmentItemAdjustmentList") or []
 	sku_qtys: dict[str, float] = {}
+	physical_return_qtys: dict[str, float] = {}
 	sku_amounts: dict[str, float] = {}
 	for adj in adj_items:
-		sku = adj.get("SellerSKU")
+		raw_sku = adj.get("SellerSKU")
+		resolved_code = _resolve_erpnext_item_code_for_sku(repo, raw_sku)
 		qty = abs(flt(adj.get("QuantityShipped")))
 		principal = sum(
 			abs(flt(c.get("ChargeAmount", {}).get("CurrencyAmount")))
 			for c in (adj.get("ItemChargeAdjustmentList") or [])
 			if c.get("ChargeType") == "Principal"
 		)
-		if sku:
-			sku_qtys[sku] = sku_qtys.get(sku, 0.0) + (qty or 1.0)
+		for key in {k for k in (raw_sku, resolved_code) if k}:
+			sku_qtys[key] = sku_qtys.get(key, 0.0) + (qty or 1.0)
+			if qty > 0:
+				physical_return_qtys[key] = physical_return_qtys.get(key, 0.0) + qty
 			if principal > 0:
-				sku_amounts[sku] = sku_amounts.get(sku, 0.0) + principal
+				sku_amounts[key] = sku_amounts.get(key, 0.0) + principal
 
 	credit_note = make_si_return(original_si_name)
 	matched_rows = []
 	for row in credit_note.items:
 		match_qty = sku_qtys.get(row.item_code) or sku_qtys.get(row.item_name)
 		if match_qty:
-			row.qty = -min(abs(flt(row.qty)), flt(match_qty))
+			effective_qty = min(abs(flt(row.qty)), flt(match_qty))
+			row.qty = -effective_qty
+			match_amount = sku_amounts.get(row.item_code) or sku_amounts.get(row.item_name)
+			if match_amount and match_amount > 0 and effective_qty > 0:
+				row.rate = flt(match_amount / effective_qty)
 			matched_rows.append(row)
 		elif not sku_qtys:
 			matched_rows.append(row)
 
 	if not matched_rows:
-		matched_rows = list(credit_note.items)
+		return None
 	credit_note.items = matched_rows
+
+	# Scale Actual tax rows proportionally on partial credit notes so a partial return does not credit 100% of order taxes.
+	orig_net = abs(flt(original_si.net_total))
+	cn_net = sum(abs(flt(r.qty) * flt(r.rate)) for r in credit_note.items)
+	if orig_net > 0 and 0 < cn_net < orig_net and getattr(credit_note, "taxes", None):
+		ratio = cn_net / orig_net
+		for tax_row in credit_note.taxes:
+			if tax_row.charge_type == "Actual":
+				tax_row.tax_amount = -abs(flt(tax_row.tax_amount) * ratio) if flt(tax_row.tax_amount) <= 0 else flt(tax_row.tax_amount) * ratio
 
 	posted_dt = refund_event.get("PostedDate")
 	candidate_date = dateutil.parser.parse(posted_dt).date() if posted_dt else today()
@@ -450,11 +538,15 @@ def _create_credit_note_from_refund(repo, refund_event: dict) -> str | None:
 		original_si.company, candidate_date, min_date=original_si.posting_date
 	)
 
-	_maybe_create_return_delivery_note(repo, order_id, sku_qtys, posting_date)
+	# Only auto-restock physical inventory on a financial refund when explicitly enabled via restock_returns.
+	if physical_return_qtys and cint(repo.amz_setting.get("restock_returns")):
+		_maybe_create_return_delivery_note(repo, order_id, physical_return_qtys, posting_date)
 
 	credit_note.set_posting_time = 1
 	credit_note.posting_date = posting_date
 	credit_note.update_stock = 0
+	if flt(original_si.outstanding_amount) > 0:
+		credit_note.update_outstanding_for_self = 0
 	if frappe.db.has_column("Sales Invoice", "amazon_order_id"):
 		credit_note.amazon_order_id = order_id
 	if frappe.db.has_column("Sales Invoice", "amazon_return_id"):
@@ -473,12 +565,13 @@ def _create_credit_note_from_refund(repo, refund_event: dict) -> str | None:
 	return credit_note.name
 
 
-def sync_returns(amz_setting_name: str, posted_after=None, posted_before=None) -> list[str]:
+def sync_returns(amz_setting_name: str | object, posted_after=None, posted_before=None) -> list[str]:
 	from amazon_connector.amazon_ext.repository import (
 		CustomAmazonRepository as AmazonRepository,
 	)
 
-	repo = AmazonRepository(amz_setting_name)
+	repo = amz_setting_name if hasattr(amz_setting_name, "amz_setting") else AmazonRepository(amz_setting_name)
+	setting_id = getattr(repo.amz_setting, "name", None) or str(amz_setting_name)
 	after = posted_after or repo.amz_setting.get("last_returns_sync") or repo.amz_setting.after_date
 	created_credit_notes = []
 	errors = []
@@ -487,6 +580,8 @@ def sync_returns(amz_setting_name: str, posted_after=None, posted_before=None) -
 		for refund_event in fin_events.get("RefundEventList") or []:
 			order_id = refund_event.get("AmazonOrderId") or "Unknown"
 			frappe.db.savepoint("amazon_return_sync")
+			prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+			frappe.flags.in_amazon_sync_savepoint = True
 			try:
 				cn_name = _create_credit_note_from_refund(repo, refund_event)
 				if cn_name:
@@ -498,8 +593,11 @@ def sync_returns(amz_setting_name: str, posted_after=None, posted_before=None) -
 					message=frappe.get_traceback(),
 					title=f"Amazon Return Sync failed for {order_id}",
 				)
+			finally:
+				frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 
-	update_setting_sync_timestamp(repo.amz_setting, "last_returns_sync")
+	if not errors:
+		update_setting_sync_timestamp(repo.amz_setting, "last_returns_sync")
 	create_log(
 		module_def=AMAZON_MODULE_DEF,
 		status="Error" if (errors and not created_credit_notes) else "Success",
@@ -517,6 +615,9 @@ def _sum_group_events(event_pages: list[dict]) -> dict[str, flt | dict]:
 	fees_by_type: dict[str, float] = {}
 	refund_total = 0.0
 	adjustments_total = 0.0
+	reserves_total = 0.0
+	order_gross_by_id: dict[str, float] = {}
+	order_refund_by_id: dict[str, float] = {}
 
 	def _record_fee(fee_type: str, raw_amount: float):
 		# In SP-API Finances, seller fees are typically negative (e.g. -150), while fee reversals are positive.
@@ -525,8 +626,10 @@ def _sum_group_events(event_pages: list[dict]) -> dict[str, flt | dict]:
 
 	for page in event_pages:
 		for ship_event in page.get("ShipmentEventList") or []:
+			order_id = ship_event.get("AmazonOrderId")
+			ship_gross = 0.0
 			for order_charge in ship_event.get("OrderChargeList") or []:
-				gross_sales_charges += flt(order_charge.get("ChargeAmount", {}).get("CurrencyAmount"))
+				ship_gross += flt(order_charge.get("ChargeAmount", {}).get("CurrencyAmount"))
 			for order_fee in ship_event.get("OrderFeeList") or []:
 				_record_fee(
 					order_fee.get("FeeType") or "OrderFee",
@@ -534,28 +637,36 @@ def _sum_group_events(event_pages: list[dict]) -> dict[str, flt | dict]:
 				)
 			for ship_item in ship_event.get("ShipmentItemList") or []:
 				for c in ship_item.get("ItemChargeList") or []:
-					gross_sales_charges += flt(c.get("ChargeAmount", {}).get("CurrencyAmount"))
+					ship_gross += flt(c.get("ChargeAmount", {}).get("CurrencyAmount"))
 				for f in ship_item.get("ItemFeeList") or []:
 					_record_fee(
 						f.get("FeeType") or "SellerFee",
 						f.get("FeeAmount", {}).get("CurrencyAmount"),
 					)
 				for p in ship_item.get("PromotionList") or []:
-					gross_sales_charges += flt(p.get("PromotionAmount", {}).get("CurrencyAmount"))
+					ship_gross += flt(p.get("PromotionAmount", {}).get("CurrencyAmount"))
 				for w in ship_item.get("ItemTaxWithheldList") or []:
 					for tc in w.get("TaxesWithheld") or []:
-						gross_sales_charges += flt(tc.get("ChargeAmount", {}).get("CurrencyAmount"))
+						ship_gross += flt(tc.get("ChargeAmount", {}).get("CurrencyAmount"))
+			gross_sales_charges += ship_gross
+			if order_id:
+				order_gross_by_id[order_id] = flt(order_gross_by_id.get(order_id, 0.0) + ship_gross, 2)
 
 		for refund_event in page.get("RefundEventList") or []:
+			order_id = refund_event.get("AmazonOrderId")
+			event_refund = 0.0
 			for adj_item in refund_event.get("ShipmentItemAdjustmentList") or []:
 				for c in adj_item.get("ItemChargeAdjustmentList") or []:
 					amt = flt(c.get("ChargeAmount", {}).get("CurrencyAmount"))
-					refund_total += abs(amt) if amt < 0 else -amt
+					event_refund += abs(amt) if amt < 0 else -amt
 				for f in adj_item.get("ItemFeeAdjustmentList") or []:
 					_record_fee(
 						f.get("FeeType") or "RefundFeeAdjustment",
 						f.get("FeeAmount", {}).get("CurrencyAmount"),
 					)
+			refund_total += event_refund
+			if order_id:
+				order_refund_by_id[order_id] = flt(order_refund_by_id.get(order_id, 0.0) + event_refund, 2)
 
 		for svc_fee in page.get("ServiceFeeEventList") or []:
 			for f in svc_fee.get("FeeList") or []:
@@ -567,12 +678,127 @@ def _sum_group_events(event_pages: list[dict]) -> dict[str, flt | dict]:
 		for adj_event in page.get("AdjustmentEventList") or []:
 			adjustments_total += flt(adj_event.get("AdjustmentAmount", {}).get("CurrencyAmount"))
 
+		for reserve_event in page.get("ReserveEventList") or []:
+			reserves_total += flt(reserve_event.get("ReserveAmount", {}).get("CurrencyAmount"))
+
 	return {
 		"gross_sales": flt(gross_sales_charges, 2),
 		"fees_by_type": fees_by_type,
 		"refund_total": flt(refund_total, 2),
 		"adjustments_total": flt(adjustments_total, 2),
+		"reserves_total": flt(reserves_total, 2),
+		"order_gross_by_id": order_gross_by_id,
+		"order_refund_by_id": order_refund_by_id,
 	}
+
+
+def _reconcile_order_receivables_for_settlement(
+	company: str,
+	order_gross_by_id: dict[str, float],
+	order_refund_by_id: dict[str, float],
+) -> tuple[list[dict], float, float]:
+	"""Build per-Sales-Invoice Receivable Journal Entry rows so Customer AR and Credit Notes clear."""
+	ar_rows: list[dict] = []
+	allocated_gross = 0.0
+	allocated_refund = 0.0
+
+	if not frappe.db.has_column("Sales Invoice", "amazon_order_id"):
+		return ar_rows, allocated_gross, allocated_refund
+
+	all_order_ids = sorted(set(order_gross_by_id.keys()) | set(order_refund_by_id.keys()))
+	for order_id in all_order_ids:
+		order_gross = flt(order_gross_by_id.get(order_id, 0.0), 2)
+		order_refund = flt(order_refund_by_id.get(order_id, 0.0), 2)
+
+		si_row = frappe.db.get_value(
+			"Sales Invoice",
+			{"amazon_order_id": order_id, "is_return": 0, "docstatus": 1, "company": company},
+			["name", "customer", "debit_to", "outstanding_amount", "grand_total"],
+			as_dict=True,
+			order_by="creation desc",
+		)
+		if not si_row or not si_row.debit_to or not si_row.customer:
+			continue
+
+		cn_rows = frappe.get_all(
+			"Sales Invoice",
+			filters={"amazon_order_id": order_id, "is_return": 1, "docstatus": 1, "company": company},
+			fields=["name", "grand_total", "outstanding_amount", "return_against", "update_outstanding_for_self"],
+		)
+		cn_offset_on_si = flt(
+			sum(abs(flt(c.grand_total)) for c in cn_rows if not cint(c.get("update_outstanding_for_self"))),
+			2,
+		)
+		outstanding = flt(si_row.outstanding_amount, 2)
+
+		# Case 1: Both ShipmentEvent and a Credit Note (with update_outstanding_for_self=0) exist in the same settlement window.
+		# The Credit Note already debited Sales Return and credited Debtors (reducing si.outstanding_amount).
+		already_offset_by_cn = min(order_gross, order_refund, cn_offset_on_si)
+		if already_offset_by_cn > 0:
+			allocated_gross = flt(allocated_gross + already_offset_by_cn, 2)
+			allocated_refund = flt(allocated_refund + already_offset_by_cn, 2)
+
+		remaining_order_gross = flt(order_gross - already_offset_by_cn, 2)
+		remaining_order_refund = flt(order_refund - already_offset_by_cn, 2)
+
+		if remaining_order_gross > 0 and outstanding > 0:
+			clear_amt = flt(min(remaining_order_gross, outstanding), 2)
+			if clear_amt > 0:
+				ar_rows.append(
+					{
+						"account": si_row.debit_to,
+						"party_type": "Customer",
+						"party": si_row.customer,
+						"reference_type": "Sales Invoice",
+						"reference_name": si_row.name,
+						"debit_in_account_currency": 0.0,
+						"credit_in_account_currency": clear_amt,
+						"user_remark": f"Amazon settlement AR clearing for order {order_id} ({si_row.name})",
+					}
+				)
+				allocated_gross = flt(allocated_gross + clear_amt, 2)
+				outstanding = flt(outstanding - clear_amt, 2)
+
+		# Case 2: Credit notes with standalone negative outstanding_amount (update_outstanding_for_self=1)
+		for cn in cn_rows:
+			cn_out = flt(cn.get("outstanding_amount"), 2)
+			if remaining_order_refund > 0 and cn_out < 0:
+				cn_clear = flt(min(remaining_order_refund, abs(cn_out)), 2)
+				if cn_clear > 0:
+					ar_rows.append(
+						{
+							"account": si_row.debit_to,
+							"party_type": "Customer",
+							"party": si_row.customer,
+							"reference_type": "Sales Invoice",
+							"reference_name": cn.name,
+							"debit_in_account_currency": cn_clear,
+							"credit_in_account_currency": 0.0,
+							"user_remark": f"Amazon settlement refund AR clearing for credit note {cn.name}",
+						}
+					)
+					allocated_refund = flt(allocated_refund + cn_clear, 2)
+					remaining_order_refund = flt(remaining_order_refund - cn_clear, 2)
+
+		# Case 3: Prior-period invoice was already settled (outstanding < 0 after a subsequent Credit Note).
+		if remaining_order_refund > 0 and outstanding < 0:
+			refund_clear_amt = flt(min(remaining_order_refund, abs(outstanding)), 2)
+			if refund_clear_amt > 0:
+				ar_rows.append(
+					{
+						"account": si_row.debit_to,
+						"party_type": "Customer",
+						"party": si_row.customer,
+						"reference_type": "Sales Invoice",
+						"reference_name": si_row.name,
+						"debit_in_account_currency": refund_clear_amt,
+						"credit_in_account_currency": 0.0,
+						"user_remark": f"Amazon settlement refund AR clearing for order {order_id} ({si_row.name})",
+					}
+				)
+				allocated_refund = flt(allocated_refund + refund_clear_amt, 2)
+
+	return ar_rows, allocated_gross, allocated_refund
 
 
 def _create_settlement_journal_entry(repo, group: dict) -> str | None:
@@ -593,12 +819,27 @@ def _create_settlement_journal_entry(repo, group: dict) -> str | None:
 	group_total_dict = group.get("OriginalTotal") or group.get("ConvertedTotal") or {}
 	has_group_total = group_total_dict.get("CurrencyAmount") is not None
 	total_fees = sum(totals["fees_by_type"].values())
+	reserves_total = flt(totals.get("reserves_total", 0.0), 2)
 	computed_payout = flt(
-		totals["gross_sales"] - total_fees - totals["refund_total"] + totals["adjustments_total"], 2
+		totals["gross_sales"]
+		- total_fees
+		- totals["refund_total"]
+		+ totals["adjustments_total"]
+		+ reserves_total,
+		2,
 	)
 	payout_amount = flt(group_total_dict.get("CurrencyAmount"), 2) if has_group_total else computed_payout
 
-	if not any((payout_amount, totals["gross_sales"], total_fees, totals["refund_total"], totals["adjustments_total"])):
+	if not any(
+		(
+			payout_amount,
+			totals["gross_sales"],
+			total_fees,
+			totals["refund_total"],
+			totals["adjustments_total"],
+			reserves_total,
+		)
+	):
 		return None
 
 	bank_account = get_or_create_leaf_account(
@@ -647,13 +888,31 @@ def _create_settlement_journal_entry(repo, group: dict) -> str | None:
 			},
 		)
 
+	ar_rows, allocated_gross, allocated_refund = _reconcile_order_receivables_for_settlement(
+		company,
+		totals.get("order_gross_by_id") or {},
+		totals.get("order_refund_by_id") or {},
+	)
+
 	_add_row(bank_account, payout_amount, f"Net payout for {group_id}")
 	for fee_type, fee_amount in sorted(totals["fees_by_type"].items()):
 		fee_acc = get_or_create_leaf_account(company, f"Amazon {fee_type}", root_type="Expense", account_type="")
 		_add_row(fee_acc, fee_amount, f"{fee_type} for {group_id}")
-	_add_row(refund_account, totals["refund_total"], f"Customer refunds for {group_id}")
-	_add_row(clearing_account, -totals["gross_sales"], f"Gross marketplace sales clearing for {group_id}")
+
+	for ar_row in ar_rows:
+		je.append("accounts", ar_row)
+
+	unallocated_refund = flt(totals["refund_total"] - allocated_refund, 2)
+	unallocated_gross = flt(totals["gross_sales"] - allocated_gross, 2)
+
+	_add_row(refund_account, unallocated_refund, f"Customer refunds for {group_id}")
+	_add_row(clearing_account, -unallocated_gross, f"Gross marketplace sales clearing for {group_id}")
 	_add_row(adjustment_account, -totals["adjustments_total"], f"Marketplace adjustments for {group_id}")
+	if reserves_total:
+		reserve_account = get_or_create_leaf_account(
+			company, "Amazon Reserve Clearing", root_type="Asset", account_type=""
+		)
+		_add_row(reserve_account, -reserves_total, f"Marketplace reserve movement for {group_id}")
 
 	total_debit = sum(flt(r.debit_in_account_currency) for r in je.accounts)
 	total_credit = sum(flt(r.credit_in_account_currency) for r in je.accounts)
@@ -682,13 +941,13 @@ def _create_settlement_journal_entry(repo, group: dict) -> str | None:
 
 
 def sync_settlements(
-	amz_setting_name: str, started_after=None, started_before=None, include_open: bool = False
+	amz_setting_name: str | object, started_after=None, started_before=None, include_open: bool = False
 ) -> list[str]:
 	from amazon_connector.amazon_ext.repository import (
 		CustomAmazonRepository as AmazonRepository,
 	)
 
-	repo = AmazonRepository(amz_setting_name)
+	repo = amz_setting_name if hasattr(amz_setting_name, "amz_setting") else AmazonRepository(amz_setting_name)
 	after = started_after or repo.amz_setting.get("last_settlements_sync") or repo.amz_setting.after_date
 	created_jes = []
 	errors = []
@@ -701,6 +960,8 @@ def sync_settlements(
 			continue
 
 		frappe.db.savepoint("amazon_settlement_sync")
+		prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+		frappe.flags.in_amazon_sync_savepoint = True
 		try:
 			je_name = _create_settlement_journal_entry(repo, group)
 			if je_name:
@@ -712,8 +973,11 @@ def sync_settlements(
 				message=frappe.get_traceback(),
 				title=f"Amazon Settlement Sync failed for {group_id}",
 			)
+		finally:
+			frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 
-	update_setting_sync_timestamp(repo.amz_setting, "last_settlements_sync")
+	if not errors:
+		update_setting_sync_timestamp(repo.amz_setting, "last_settlements_sync")
 	create_log(
 		module_def=AMAZON_MODULE_DEF,
 		status="Error" if (errors and not created_jes) else "Success",

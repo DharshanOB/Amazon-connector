@@ -6,6 +6,24 @@ frappe.ui.form.on("Amazon SP API Settings", {
 		frm.trigger("set_ext_queries");
 
 		if (frm.doc.is_active && !frm.doc.__islocal) {
+			frm.add_custom_button(__("Sync Amazon Categories"), function () {
+				frappe.call({
+					method: "amazon_connector.amazon_ext.outbound.sync_amazon_product_types",
+					args: { amz_setting_name: frm.doc.name },
+					freeze: true,
+					freeze_message: __("Syncing categories from Amazon SP-API..."),
+					callback: function (r) {
+						if (!r.exc && r.message) {
+							frappe.msgprint({
+								title: __("Categories Synced"),
+								indicator: "green",
+								message: __("Successfully synced {0} Amazon product categories.", [r.message.synced || r.message.total]),
+							});
+						}
+					},
+				});
+			});
+
 			frm.add_custom_button(__("Push Item to Amazon"), function () {
 				frappe.prompt(
 					[

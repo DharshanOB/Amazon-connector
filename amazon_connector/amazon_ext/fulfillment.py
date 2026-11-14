@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import time
+import zlib
 from datetime import datetime, timezone
 
 import dateutil.parser
@@ -17,6 +18,7 @@ from amazon_connector.amazon_ext.listings import get_amazon_module_name
 from amazon_connector.amazon_ext.outbound import (
 	AmazonOutboundSync,
 	get_configured_warehouses,
+	get_expanded_warehouses,
 	safe_create_amazon_log,
 )
 from amazon_connector.amazon_ext.repository import (
@@ -331,6 +333,9 @@ def confirm_delivery_note_shipment_now(delivery_note_name: str) -> dict:
 	if ctx.get("imported_from_amazon") or ctx.get("fulfillment_channel") == "AFN":
 		frappe.throw(_("Delivery Note {0} is Amazon-fulfilled or imported from Amazon and cannot be confirmed manually.").format(doc.name))
 
+	if ctx.get("amazon_canceled"):
+		frappe.throw(_("Linked Amazon Sales Order for Delivery Note {0} is marked canceled.").format(doc.name))
+
 	carrier_raw, tracking = _extract_dn_carrier_and_tracking(doc)
 	if not carrier_raw or not tracking:
 		frappe.throw(_("Carrier and Tracking Number are required before confirming shipment with Amazon SP-API."))
@@ -574,8 +579,10 @@ def create_delivery_note_from_amazon_order(
 	if not amazon_order_id or order_status not in ("Shipped", "PartiallyShipped"):
 		return None
 
-	savepoint_name = f"amazon_dn_{abs(hash(amazon_order_id)) % 1000000}"
+	savepoint_name = f"amazon_dn_{zlib.crc32(str(amazon_order_id).encode('utf-8')) % 1000000}"
 	frappe.db.savepoint(savepoint_name)
+	prev_sp_flag = getattr(frappe.flags, "in_amazon_sync_savepoint", False)
+	frappe.flags.in_amazon_sync_savepoint = True
 	try:
 		so_name = sales_order_name
 		if not so_name and frappe.db.has_column("Sales Order", "amazon_order_id"):
@@ -630,6 +637,7 @@ def create_delivery_note_from_amazon_order(
 		return _insert_and_try_submit_dn(dn_doc)
 	except Exception as exc:
 		frappe.db.rollback(save_point=savepoint_name)
+		frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
 		create_amazon_log(
 			status="Error",
 			method="amazon_connector.amazon_ext.fulfillment.create_delivery_note_from_amazon_order",
@@ -639,6 +647,22 @@ def create_delivery_note_from_amazon_order(
 			rollback=False,
 		)
 		return None
+	finally:
+		frappe.flags.in_amazon_sync_savepoint = prev_sp_flag
+
+
+def handle_sales_order_stock_reservation(doc, method=None):
+	"""Sales Order on_submit / on_cancel hook: push updated reserved stock availability to Amazon."""
+	if getattr(frappe.flags, "from_amazon_fba_sync", False):
+		return
+	channel = (
+		doc.get("fulfillment_channel")
+		if frappe.db.has_column("Sales Order", "fulfillment_channel")
+		else None
+	)
+	if channel == "AFN":
+		return
+	_enqueue_dn_items_stock_sync(doc)
 
 
 def handle_stock_ledger_entry(doc, method=None):
@@ -726,7 +750,19 @@ def sync_stock_job(amz_setting_name: str, item_code: str, warehouse: str | None 
 
 def handle_item_price_change(doc, method=None):
 	"""Item Price on_update hook: enqueue selling price push to Amazon SP-API."""
+	if (
+		getattr(getattr(doc, "flags", None), "from_amazon_sync", False)
+		or frappe.flags.get("in_amazon_listing_sync")
+		or frappe.flags.get("from_amazon_fba_sync")
+	):
+		return
 	if not cint(getattr(doc, "selling", 0)):
+		return
+	if (
+		doc.get("customer")
+		or doc.get("batch_no")
+		or flt(doc.get("packing_unit") or doc.get("min_qty") or 0) > 1.0
+	):
 		return
 	if not doc.get("item_code") or not is_item_mapped_to_amazon(doc.item_code):
 		return
@@ -812,7 +848,7 @@ def _reconcile_setting_items(setting) -> None:
 	repo = AmazonRepository(amz_setting)
 	outbound = AmazonOutboundSync(repo)
 	configured_warehouses = get_configured_warehouses(amz_setting)
-	afn_only_items = _get_afn_only_items()
+	afn_only_items = _get_afn_only_items(amz_setting)
 
 	ecom_fields = ["name", "erpnext_item_code", "sku", "inventory_synced_on", "item_synced_on"]
 	if frappe.db.has_column("Ecommerce Item", "status"):
@@ -871,24 +907,55 @@ def _reconcile_setting_items(setting) -> None:
 			)
 
 
-def _get_afn_only_items() -> set[str]:
-	if not frappe.db.has_column("Sales Order", "fulfillment_channel"):
-		return set()
-	rows = frappe.db.sql(
-		"""
-		SELECT soi.item_code, so.fulfillment_channel
-		FROM `tabSales Order Item` soi
-		INNER JOIN `tabSales Order` so ON so.name = soi.parent
-		WHERE so.docstatus < 2
-		  AND so.fulfillment_channel IN ('AFN', 'MFN')
-		GROUP BY soi.item_code, so.fulfillment_channel
-		""",
-		as_dict=True,
-	)
+def _get_afn_only_items(amz_setting=None) -> set[str]:
 	channels_by_item: dict[str, set[str]] = {}
-	for row in rows:
-		channels_by_item.setdefault(row.item_code, set()).add(row.fulfillment_channel)
-	return {item for item, channels in channels_by_item.items() if "AFN" in channels and "MFN" not in channels}
+	if frappe.db.has_column("Sales Order", "fulfillment_channel"):
+		rows = frappe.db.sql(
+			"""
+			SELECT soi.item_code, so.fulfillment_channel
+			FROM `tabSales Order Item` soi
+			INNER JOIN `tabSales Order` so ON so.name = soi.parent
+			WHERE so.docstatus < 2
+			  AND so.fulfillment_channel IN ('AFN', 'MFN')
+			GROUP BY soi.item_code, so.fulfillment_channel
+			""",
+			as_dict=True,
+		)
+		for row in rows:
+			channels_by_item.setdefault(row.item_code, set()).add(row.fulfillment_channel)
+
+	afn_only = {item for item, channels in channels_by_item.items() if "AFN" in channels and "MFN" not in channels}
+
+	if amz_setting:
+		fba_wh = (
+			amz_setting.get("fba_warehouse")
+			if isinstance(amz_setting, dict)
+			else getattr(amz_setting, "fba_warehouse", None)
+		)
+		mfn_warehouses = set(get_configured_warehouses(amz_setting))
+		if fba_wh:
+			fba_warehouses = set(get_expanded_warehouses([fba_wh])) - mfn_warehouses
+			if fba_warehouses:
+				fba_bins = frappe.get_all(
+					"Bin",
+					filters={"warehouse": ["in", list(fba_warehouses)], "actual_qty": [">", 0]},
+					pluck="item_code",
+				)
+				for item_code in set(fba_bins):
+					if "MFN" in channels_by_item.get(item_code, set()):
+						continue
+					has_mfn_stock = False
+					if mfn_warehouses:
+						mfn_qty = frappe.get_all(
+							"Bin",
+							filters={"item_code": item_code, "warehouse": ["in", list(mfn_warehouses)], "actual_qty": [">", 0]},
+							limit=1,
+						)
+						has_mfn_stock = bool(mfn_qty)
+					if not has_mfn_stock:
+						afn_only.add(item_code)
+
+	return afn_only
 
 
 def _has_stock_delta(item_code: str, last_synced_on, warehouses: tuple[str, ...]) -> bool:
@@ -933,22 +1000,30 @@ def _extract_dn_amazon_context(dn_doc) -> dict:
 	amazon_canceled = 0
 
 	so_names = sorted({item.get("against_sales_order") for item in (dn_doc.get("items") or []) if item.get("against_sales_order")})
-	if so_names and (not amazon_order_id or not channel or not marketplace_id):
-		so_fields = ["name"]
-		for field in ("amazon_order_id", "marketplace_id", "fulfillment_channel", "amazon_canceled"):
-			if frappe.db.has_column("Sales Order", field):
-				so_fields.append(field)
-		if len(so_fields) > 1:
+	so_fields = ["name"]
+	for field in ("amazon_order_id", "marketplace_id", "fulfillment_channel", "amazon_canceled", "amazon_order_status"):
+		if frappe.db.has_column("Sales Order", field):
+			so_fields.append(field)
+
+	if len(so_fields) > 1:
+		so_rows = []
+		if so_names:
 			so_rows = frappe.get_all("Sales Order", filters={"name": ["in", so_names]}, fields=so_fields)
-			for row in so_rows:
-				if not amazon_order_id and row.get("amazon_order_id"):
-					amazon_order_id = row.get("amazon_order_id")
-				if not marketplace_id and row.get("marketplace_id"):
-					marketplace_id = row.get("marketplace_id")
-				if not channel and row.get("fulfillment_channel"):
-					channel = row.get("fulfillment_channel")
-				if cint(row.get("amazon_canceled")):
-					amazon_canceled = 1
+		elif amazon_order_id and "amazon_order_id" in so_fields:
+			so_rows = frappe.get_all(
+				"Sales Order",
+				filters={"amazon_order_id": amazon_order_id, "docstatus": ["<", 2]},
+				fields=so_fields,
+			)
+		for row in so_rows:
+			if not amazon_order_id and row.get("amazon_order_id"):
+				amazon_order_id = row.get("amazon_order_id")
+			if not marketplace_id and row.get("marketplace_id"):
+				marketplace_id = row.get("marketplace_id")
+			if not channel and row.get("fulfillment_channel"):
+				channel = row.get("fulfillment_channel")
+			if cint(row.get("amazon_canceled")) or str(row.get("amazon_order_status") or "").strip().lower() in ("canceled", "cancelled"):
+				amazon_canceled = 1
 
 	return {
 		"amazon_order_id": amazon_order_id,
@@ -976,8 +1051,14 @@ def _build_package_detail(
 	ship_date,
 	order_items: list[dict],
 ) -> dict:
+	raw_ref = str(delivery_note_name or "1").strip()
+	pkg_ref_id = (
+		raw_ref
+		if raw_ref.isdigit() and int(raw_ref) > 0
+		else str((zlib.crc32(raw_ref.encode("utf-8")) % 900000) + 100000)
+	)
 	pkg = {
-		"packageReferenceId": delivery_note_name,
+		"packageReferenceId": pkg_ref_id,
 		"carrierCode": carrier_code,
 		"carrierName": carrier_name or carrier_code,
 		"trackingNumber": tracking_number,
@@ -1315,7 +1396,7 @@ def _insert_and_try_submit_dn(dn_doc) -> str:
 
 
 def _try_submit_imported_dn(dn_doc) -> str:
-	submit_sp = f"amazon_dn_submit_{abs(hash(dn_doc.name)) % 1000000}"
+	submit_sp = f"amazon_dn_submit_{zlib.crc32(str(dn_doc.name).encode('utf-8')) % 1000000}"
 	frappe.db.savepoint(submit_sp)
 	try:
 		dn_doc.submit()

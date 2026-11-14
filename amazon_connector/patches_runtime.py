@@ -4,9 +4,21 @@
 import frappe
 
 _PATCHES_APPLIED = False
+_ORIGINAL_SCHEDULER = None
+
+
+def _is_amazon_connector_installed() -> bool:
+	try:
+		if getattr(frappe.local, "site", None):
+			return "amazon_connector" in frappe.get_installed_apps()
+	except Exception:
+		pass
+	return True
 
 
 def _noop_scheduler(*args, **kwargs):
+	if not _is_amazon_connector_installed() and callable(_ORIGINAL_SCHEDULER):
+		return _ORIGINAL_SCHEDULER(*args, **kwargs)
 	return None
 
 
@@ -82,6 +94,9 @@ def apply_amazon_patches(*args, **kwargs):
 	upstream_sp_api.__all__ = list(sp_api.__all__)
 
 	# Disable upstream hourly order sync so hourly_long in amazon_connector runs without duplication.
+	global _ORIGINAL_SCHEDULER
+	if _ORIGINAL_SCHEDULER is None and upstream_settings.schedule_get_order_details is not _noop_scheduler:
+		_ORIGINAL_SCHEDULER = upstream_settings.schedule_get_order_details
 	upstream_settings.schedule_get_order_details = _noop_scheduler
 
 	upstream_log.create_log = log_patch.create_log

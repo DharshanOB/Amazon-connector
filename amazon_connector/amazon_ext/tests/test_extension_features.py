@@ -539,3 +539,517 @@ class TestAmazonExtensionIntegration(IntegrationTestCase):
 			frappe.delete_doc("Item", item_code, force=1, ignore_permissions=True)
 			if created_fba_wh and frappe.db.exists("Warehouse", created_fba_wh):
 				frappe.delete_doc("Warehouse", created_fba_wh, force=1, ignore_permissions=True)
+
+	def test_settlement_reconciles_customer_ar_and_expense_root_type(self):
+		from amazon_connector.amazon_ext.lifecycle import (
+			create_sales_invoice_from_sales_order,
+			get_or_create_leaf_account,
+			sync_returns,
+			sync_settlements,
+		)
+		from frappe.utils import flt
+
+		company, mfn_wh, fba_wh, price_list = _get_company_and_warehouses()
+		item1 = _create_stock_item(company, "EXT-FIN-1")
+		item2 = _create_stock_item(company, "EXT-FIN-2")
+		sku1 = _uid("SKU-FIN1")
+		sku2 = _uid("SKU-FIN2")
+
+		ecom1 = frappe.get_doc(
+			{
+				"doctype": "Ecommerce Item",
+				"integration": "Amazon",
+				"erpnext_item_code": item1,
+				"integration_item_code": item1,
+				"sku": sku1,
+			}
+		).insert(ignore_permissions=True)
+		ecom2 = frappe.get_doc(
+			{
+				"doctype": "Ecommerce Item",
+				"integration": "Amazon",
+				"erpnext_item_code": item2,
+				"integration_item_code": item2,
+				"sku": sku2,
+			}
+		).insert(ignore_permissions=True)
+
+		# Verify get_or_create_leaf_account with root_type="Expense" never returns an Asset/Receivable account
+		ar_parent = frappe.db.get_value(
+			"Account", {"company": company, "root_type": "Asset", "is_group": 1}, "name"
+		)
+		collision_name = _uid("Amazon Commission Collide")
+		asset_acct = frappe.get_doc(
+			{
+				"doctype": "Account",
+				"account_name": collision_name,
+				"parent_account": ar_parent,
+				"company": company,
+				"is_group": 0,
+				"account_type": "Receivable",
+			}
+		).insert(ignore_permissions=True)
+
+		exp_acct_name = get_or_create_leaf_account(company, collision_name, root_type="Expense")
+		self.assertNotEqual(exp_acct_name, asset_acct.name)
+		self.assertEqual(frappe.db.get_value("Account", exp_acct_name, "root_type"), "Expense")
+
+		order_id = _uid("402-SETTLE")
+		group_id = _uid("FIN-GRP")
+		buyer_email = f"{_uid('finbuyer').lower()}@example.com"
+		repo = _make_fake_repo(company, mfn_wh, fba_warehouse=fba_wh, price_list=price_list)
+		repo.amz_setting.auto_create_sales_invoice = 1
+		repo.amz_setting.auto_sync_returns = 1
+		repo.amz_setting.auto_sync_settlements = 1
+
+		order_payload = {
+			"AmazonOrderId": order_id,
+			"PurchaseDate": "2026-11-10T10:00:00Z",
+			"LatestShipDate": "2026-11-12T10:00:00Z",
+			"OrderStatus": "Shipped",
+			"FulfillmentChannel": "MFN",
+			"MarketplaceId": "A21TJRUUN4KGV",
+			"BuyerInfo": {"BuyerEmail": buyer_email, "BuyerName": "Settlement Buyer"},
+			"ShippingAddress": {
+				"Name": "Settlement Buyer",
+				"AddressLine1": "100 MG Road",
+				"City": "Bengaluru",
+				"StateOrRegion": "KA",
+				"PostalCode": "560001",
+				"CountryCode": "IN",
+			},
+		}
+		items_payload = {
+			"payload": {
+				"OrderItems": [
+					{
+						"ASIN": item1,
+						"OrderItemId": f"OI-1-{order_id}",
+						"SellerSKU": sku1,
+						"QuantityOrdered": 2,
+						"QuantityShipped": 2,
+						"ItemPrice": {"CurrencyCode": "INR", "Amount": "200.00"},
+					},
+					{
+						"ASIN": item2,
+						"OrderItemId": f"OI-2-{order_id}",
+						"SellerSKU": sku2,
+						"QuantityOrdered": 1,
+						"QuantityShipped": 1,
+						"ItemPrice": {"CurrencyCode": "INR", "Amount": "100.00"},
+					},
+				]
+			}
+		}
+
+		finances_mock = MagicMock()
+		# Partial price concession of 40.00 on sku1 (originally 200.00 for 2 units)
+		finances_mock.list_financial_events.return_value = {
+			"payload": {
+				"FinancialEvents": {
+					"RefundEventList": [
+						{
+							"AmazonOrderId": order_id,
+							"PostedDate": "2026-11-11T10:00:00Z",
+							"ShipmentItemAdjustmentList": [
+								{
+									"SellerSKU": sku1,
+									"QuantityShipped": 1,
+									"ItemChargeAdjustmentList": [
+										{
+											"ChargeType": "Principal",
+											"ChargeAmount": {"CurrencyCode": "INR", "CurrencyAmount": -40.00},
+										}
+									],
+								}
+							],
+						}
+					]
+				}
+			}
+		}
+		finances_mock.list_financial_event_groups.return_value = {
+			"payload": {
+				"FinancialEventGroupList": [
+					{
+						"FinancialEventGroupId": group_id,
+						"ProcessingStatus": "Closed",
+						"FundTransferDate": "2026-11-12T10:00:00Z",
+						"OriginalTotal": {"CurrencyCode": "INR", "CurrencyAmount": 410.00},
+					}
+				]
+			}
+		}
+		finances_mock.list_financial_events_by_group_id.return_value = {
+			"payload": {
+				"FinancialEvents": {
+					"ShipmentEventList": [
+						{
+							"AmazonOrderId": order_id,
+							"ShipmentItemList": [
+								{
+									"SellerSKU": sku1,
+									"ItemChargeList": [
+										{
+											"ChargeType": "Principal",
+											"ChargeAmount": {"CurrencyCode": "INR", "CurrencyAmount": 200.00},
+										}
+									],
+									"ItemFeeList": [
+										{
+											"FeeType": "Commission",
+											"FeeAmount": {"CurrencyCode": "INR", "CurrencyAmount": -30.00},
+										}
+									],
+								},
+								{
+									"SellerSKU": sku2,
+									"ItemChargeList": [
+										{
+											"ChargeType": "Principal",
+											"ChargeAmount": {"CurrencyCode": "INR", "CurrencyAmount": 100.00},
+										}
+									],
+									"ItemFeeList": [],
+								},
+							],
+						}
+					],
+					"RefundEventList": [
+						{
+							"AmazonOrderId": order_id,
+							"ShipmentItemAdjustmentList": [
+								{
+									"SellerSKU": sku1,
+									"ItemChargeAdjustmentList": [
+										{
+											"ChargeType": "Principal",
+											"ChargeAmount": {"CurrencyCode": "INR", "CurrencyAmount": -40.00},
+										}
+									],
+								}
+							],
+						}
+					],
+					"ReserveEventList": [
+						{
+							"ReserveType": "ReserveDebit",
+							"ReserveAmount": {"CurrencyCode": "INR", "CurrencyAmount": -20.00},
+						}
+					],
+				}
+			}
+		}
+
+		so_name = None
+		try:
+			with (
+				patch.object(
+					repo,
+					"get_orders_instance",
+					return_value=frappe._dict(
+						get_order_items=lambda order_id, next_token=None: items_payload
+					),
+				),
+				patch.object(repo, "get_finances_instance", return_value=finances_mock),
+			):
+				so_name = repo.create_sales_order(order_payload)
+				self.assertIsNotNone(so_name)
+
+				si_List = frappe.get_all(
+					"Sales Invoice",
+					filters={"amazon_order_id": order_id, "is_return": 0, "docstatus": 1},
+					pluck="name",
+				)
+				if not si_List:
+					si_name = create_sales_invoice_from_sales_order(
+						repo, so_name
+					)
+				else:
+					si_name = si_List[0]
+				self.assertIsNotNone(si_name)
+				self.assertEqual(flt(frappe.db.get_value("Sales Invoice", si_name, "grand_total")), 300.0)
+				self.assertEqual(flt(frappe.db.get_value("Sales Invoice", si_name, "outstanding_amount")), 300.0)
+
+				# Sync returns: partial concession of 40.00 on sku1 (mapped to item1 via Ecommerce Item)
+				ret_created = sync_returns(repo, posted_after="2026-11-01")
+				self.assertEqual(len(ret_created), 1)
+				cn_name = ret_created[0]
+				self.assertIsNotNone(cn_name)
+				cn_doc = frappe.get_doc("Sales Invoice", cn_name)
+				# Must only include item1 (NOT item2!) and refund -40.00 (NOT -100.00 or -200.00!)
+				self.assertEqual(len(cn_doc.items), 1)
+				self.assertEqual(cn_doc.items[0].item_code, item1)
+				self.assertAlmostEqual(abs(flt(cn_doc.grand_total)), 40.0, places=2)
+				# Outstanding on original SI is now 300 - 40 = 260
+				self.assertAlmostEqual(
+					flt(frappe.db.get_value("Sales Invoice", si_name, "outstanding_amount")),
+					260.0,
+					places=2,
+				)
+
+				# Sync settlement: must clear the remaining 260.0 Customer AR on si_name!
+				settle_created = sync_settlements(repo, started_after="2026-11-01")
+				self.assertEqual(len(settle_created), 1)
+				je_name = settle_created[0]
+				self.assertIsNotNone(je_name)
+				self.assertAlmostEqual(
+					flt(frappe.db.get_value("Sales Invoice", si_name, "outstanding_amount")),
+					0.0,
+					places=2,
+				)
+		finally:
+			for je_id in frappe.get_all("Journal Entry", filters={"cheque_no": group_id}, pluck="name"):
+				je = frappe.get_doc("Journal Entry", je_id)
+				if je.docstatus == 1:
+					je.cancel()
+				frappe.delete_doc("Journal Entry", je_id, force=1, ignore_permissions=True)
+
+			for si_id in frappe.get_all(
+				"Sales Invoice",
+				filters={"amazon_order_id": order_id},
+				order_by="is_return desc",
+				pluck="name",
+			):
+				si = frappe.get_doc("Sales Invoice", si_id)
+				if si.docstatus == 1:
+					si.cancel()
+				frappe.delete_doc("Sales Invoice", si_id, force=1, ignore_permissions=True)
+
+			for dn_id in frappe.get_all("Delivery Note", filters={"amazon_order_id": order_id}, pluck="name"):
+				dn = frappe.get_doc("Delivery Note", dn_id)
+				if dn.docstatus == 1:
+					dn.cancel()
+				frappe.delete_doc("Delivery Note", dn_id, force=1, ignore_permissions=True)
+
+			for so_id in frappe.get_all("Sales Order", filters={"amazon_order_id": order_id}, pluck="name"):
+				so = frappe.get_doc("Sales Order", so_id)
+				if so.docstatus == 1:
+					so.cancel()
+				frappe.delete_doc("Sales Order", so_id, force=1, ignore_permissions=True)
+
+			frappe.delete_doc("Ecommerce Item", ecom1.name, force=1, ignore_permissions=True)
+			frappe.delete_doc("Ecommerce Item", ecom2.name, force=1, ignore_permissions=True)
+			frappe.delete_doc("Item", item1, force=1, ignore_permissions=True)
+			frappe.delete_doc("Item", item2, force=1, ignore_permissions=True)
+
+	def test_pending_order_upgrades_when_unshipped_and_charges_withheld_tax(self):
+		from frappe.utils import flt
+
+		company, mfn_wh, fba_wh, price_list = _get_company_and_warehouses()
+		item_code = _create_stock_item(company, "EXT-PEND")
+		ecom = frappe.get_doc(
+			{
+				"doctype": "Ecommerce Item",
+				"integration": "Amazon",
+				"erpnext_item_code": item_code,
+				"integration_item_code": item_code,
+				"sku": item_code,
+			}
+		).insert(ignore_permissions=True)
+
+		order_id = _uid("402-PEND")
+		repo = _make_fake_repo(company, mfn_wh, fba_warehouse=fba_wh, price_list=price_list)
+		repo.amz_setting.taxes_charges = 1
+		repo.amz_setting.calculate_taxes_via_erpnext = 0
+		repo.amz_setting.auto_create_sales_invoice = 1
+
+		pending_order = {
+			"AmazonOrderId": order_id,
+			"PurchaseDate": "2026-11-10T10:00:00Z",
+			"LatestShipDate": "2026-11-12T10:00:00Z",
+			"OrderStatus": "Pending",
+			"FulfillmentChannel": "MFN",
+			"MarketplaceId": "A21TJRUUN4KGV",
+			"BuyerInfo": {},
+			"ShippingAddress": {},
+		}
+		pending_items = {
+			"payload": {
+				"OrderItems": [
+					{
+						"ASIN": item_code,
+						"OrderItemId": f"OI-{order_id}",
+						"SellerSKU": item_code,
+						"QuantityOrdered": 1,
+						"ItemPrice": {"CurrencyCode": "INR", "Amount": "0.00"},
+					}
+				]
+			}
+		}
+
+		confirmed_order = {
+			**pending_order,
+			"OrderStatus": "Unshipped",
+			"BuyerInfo": {"BuyerEmail": f"{_uid('pend').lower()}@example.com", "BuyerName": "Confirmed Buyer"},
+			"ShippingAddress": {
+				"Name": "Confirmed Buyer",
+				"AddressLine1": "22 Park Street",
+				"City": "Kolkata",
+				"StateOrRegion": "WB",
+				"PostalCode": "700016",
+				"CountryCode": "IN",
+			},
+		}
+		confirmed_items = {
+			"payload": {
+				"OrderItems": [
+					{
+						"ASIN": item_code,
+						"OrderItemId": f"OI-{order_id}",
+						"SellerSKU": item_code,
+						"QuantityOrdered": 1,
+						"ItemPrice": {"CurrencyCode": "INR", "Amount": "500.00"},
+						"ItemTax": {"CurrencyCode": "INR", "Amount": "45.00"},
+						"GiftWrap": {"CurrencyCode": "INR", "Amount": "20.00"},
+						"GiftWrapTax": {"CurrencyCode": "INR", "Amount": "3.60"},
+						"PromotionDiscount": {"CurrencyCode": "INR", "Amount": "50.00"},
+						"ItemTaxWithheldList": [
+							{
+								"TaxCollectionModel": "MarketplaceFacilitator",
+								"TaxesWithheld": [
+									{
+										"ChargeType": "MarketplaceFacilitatorTax-Principal",
+										"ChargeAmount": {"CurrencyCode": "INR", "Amount": "-48.60"},
+									}
+								],
+							}
+						],
+					}
+				]
+			}
+		}
+
+		finances_empty = MagicMock()
+		finances_empty.list_financial_events_by_order_id.return_value = {"payload": {"FinancialEvents": {}}}
+
+		try:
+			with (
+				patch.object(
+					repo,
+					"get_orders_instance",
+					return_value=frappe._dict(
+						get_order_items=lambda order_id, next_token=None: pending_items
+					),
+				),
+				patch.object(repo, "get_finances_instance", return_value=finances_empty),
+			):
+				so_pending_name = repo.create_sales_order(pending_order)
+				self.assertIsNotNone(so_pending_name)
+				self.assertEqual(flt(frappe.db.get_value("Sales Order", so_pending_name, "grand_total")), 0.0)
+				# Pending order must NOT auto-create a Sales Invoice
+				self.assertFalse(
+					frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "docstatus": 1})
+				)
+
+			# Now order transitions from Pending -> Unshipped with real price, GiftWrap, PromotionDiscount, and MFT withheld tax
+			with (
+				patch.object(
+					repo,
+					"get_orders_instance",
+					return_value=frappe._dict(
+						get_order_items=lambda order_id, next_token=None: confirmed_items
+					),
+				),
+				patch.object(repo, "get_finances_instance", return_value=finances_empty),
+			):
+				so_confirmed_name = repo.create_sales_order(confirmed_order)
+				self.assertIsNotNone(so_confirmed_name)
+				so_doc = frappe.get_doc("Sales Order", so_confirmed_name)
+				# Net = 500 (Item) + 45 (ItemTax) + 20 (GiftWrap) + 3.60 (GiftWrapTax) - 50 (Promo) - 48.60 (Withheld MFT) = 470.00
+				self.assertAlmostEqual(flt(so_doc.grand_total), 470.0, places=2)
+		finally:
+			for si_id in frappe.get_all("Sales Invoice", filters={"amazon_order_id": order_id}, pluck="name"):
+				si = frappe.get_doc("Sales Invoice", si_id)
+				if si.docstatus == 1:
+					si.cancel()
+				frappe.delete_doc("Sales Invoice", si_id, force=1, ignore_permissions=True)
+
+			for so_id in frappe.get_all("Sales Order", filters={"amazon_order_id": order_id}, pluck="name"):
+				so = frappe.get_doc("Sales Order", so_id)
+				if so.docstatus == 1:
+					so.cancel()
+				frappe.delete_doc("Sales Order", so_id, force=1, ignore_permissions=True)
+
+			frappe.delete_doc("Ecommerce Item", ecom.name, force=1, ignore_permissions=True)
+			frappe.delete_doc("Item", item_code, force=1, ignore_permissions=True)
+
+	def test_customer_and_min_qty_prices_ignored_and_ssrf_blocked(self):
+		from amazon_connector.amazon_ext.outbound import AmazonOutboundSync
+		from amazon_connector.amazon_ext.repository import resolve_custom_endpoint
+		from amazon_connector.amazon_ext.sp_api import Reports, SPAPIError
+
+		# 1. SSRF / scheme validation on custom_endpoint and download_report_document
+		with self.assertRaises(frappe.ValidationError):
+			resolve_custom_endpoint({"custom_endpoint": "http://169.254.169.254/latest/meta-data/"})
+		with self.assertRaises(frappe.ValidationError):
+			resolve_custom_endpoint({"custom_endpoint": "file:///etc/passwd"})
+
+		rep = Reports(
+			iam_arn="arn:aws:iam::123:role/test",
+			client_id="C",
+			client_secret="S",
+			refresh_token="R",
+			aws_access_key="AK",
+			aws_secret_key="SK",
+			country_code="IN",
+		)
+		with self.assertRaises(SPAPIError):
+			rep.download_report_document({"url": "http://169.254.169.254/latest/meta-data/"})
+
+		# 2. Numeric packageReferenceId in _build_package_detail
+		pkg = amazon_fulfillment._build_package_detail(
+			delivery_note_name="MAT-DN-2026-00042",
+			carrier_code="Blue Dart",
+			carrier_name="Blue Dart",
+			tracking_number="BD-999",
+			ship_date="2026-11-12",
+			order_items=[{"orderItemId": "OI-1", "quantity": 1}],
+		)
+		self.assertTrue(pkg["packageReferenceId"].isdigit())
+		self.assertGreater(int(pkg["packageReferenceId"]), 0)
+
+		# 3. Customer-specific and packing_unit > 1 Item Prices ignored by outbound price resolver
+		company, mfn_wh, fba_wh, price_list = _get_company_and_warehouses()
+		item_code = _create_stock_item(company, "EXT-PRC")
+		customer = frappe.get_all("Customer", limit=1, pluck="name")[0]
+
+		p_general = frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": price_list,
+				"price_list_rate": 500.0,
+				"selling": 1,
+			}
+		).insert(ignore_permissions=True)
+		p_cust = frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": price_list,
+				"price_list_rate": 199.0,
+				"selling": 1,
+				"customer": customer,
+			}
+		).insert(ignore_permissions=True)
+		p_bulk = frappe.get_doc(
+			{
+				"doctype": "Item Price",
+				"item_code": item_code,
+				"price_list": price_list,
+				"price_list_rate": 299.0,
+				"selling": 1,
+				"packing_unit": 10,
+			}
+		).insert(ignore_permissions=True)
+
+		try:
+			repo = _make_fake_repo(company, mfn_wh, price_list=price_list)
+			outbound = AmazonOutboundSync(repo)
+			self.assertEqual(outbound.get_item_price(item_code, price_list=price_list), 500.0)
+		finally:
+			for p in (p_bulk, p_cust, p_general):
+				frappe.delete_doc("Item Price", p.name, force=1, ignore_permissions=True)
+			frappe.delete_doc("Item", item_code, force=1, ignore_permissions=True)
+

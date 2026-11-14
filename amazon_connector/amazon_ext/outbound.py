@@ -2,8 +2,10 @@
 # For license information, please see license.txt
 
 import json
+import re
 import time
 
+import requests
 import frappe
 from frappe import _
 from frappe.utils import flt, getdate, now, strip_html, today
@@ -40,6 +42,102 @@ COUNTRY_CURRENCIES = {
 	"SG": "SGD",
 	"AU": "AUD",
 	"JP": "JPY",
+}
+
+COUNTRY_LANGUAGE_TAGS = {
+	"IN": "en_IN",
+	"US": "en_US",
+	"GB": "en_GB",
+	"CA": "en_CA",
+	"AU": "en_AU",
+	"SG": "en_SG",
+	"AE": "en_AE",
+	"DE": "de_DE",
+	"FR": "fr_FR",
+	"IT": "it_IT",
+	"ES": "es_ES",
+	"NL": "nl_NL",
+	"SE": "sv_SE",
+	"PL": "pl_PL",
+	"TR": "tr_TR",
+	"SA": "ar_SA",
+	"EG": "ar_EG",
+	"JP": "ja_JP",
+	"MX": "es_MX",
+	"BR": "pt_BR",
+}
+
+AMAZON_WEIGHT_UNIT_MAP = {
+	"g": "grams",
+	"gm": "grams",
+	"gms": "grams",
+	"gram": "grams",
+	"grams": "grams",
+	"kg": "kilograms",
+	"kgs": "kilograms",
+	"kilo": "kilograms",
+	"kilogram": "kilograms",
+	"kilograms": "kilograms",
+	"mg": "milligrams",
+	"mgs": "milligrams",
+	"milligram": "milligrams",
+	"milligrams": "milligrams",
+	"oz": "ounces",
+	"ounce": "ounces",
+	"ounces": "ounces",
+	"lb": "pounds",
+	"lbs": "pounds",
+	"pound": "pounds",
+	"pounds": "pounds",
+	"ton": "tons",
+	"tons": "tons",
+	"tonne": "tons",
+	"tonnes": "tons",
+	"mt": "tons",
+	"hundredths_pounds": "hundredths_pounds",
+}
+
+NO_MARKETPLACE_ID_ATTRS = frozenset({"rtip_manufacturer_contact_information", "fulfillment_availability"})
+STANDARD_AUTO_ATTRS = frozenset({
+	"item_name",
+	"brand",
+	"product_description",
+	"country_of_origin",
+	"external_product_information",
+	"merchant_suggested_asin",
+	"externally_assigned_product_identifier",
+	"fulfillment_availability",
+	"purchasable_offer",
+	"item_weight",
+	"supplier_declared_dg_hz_regulation",
+	"packer_contact_information",
+	"importer_contact_information",
+	"rtip_manufacturer_contact_information",
+	"manufacturer",
+	"condition_type",
+	"merchant_shipping_group",
+})
+ASIN_PATTERN = re.compile(r"^B0[A-Z0-9]{8}$")
+
+VARIANT_ATTRIBUTE_ALIASES = {
+	"colour": "color",
+	"color_name": "color",
+	"size_name": "size",
+	"apparel_size": "size",
+	"book_binding": "binding",
+	"format": "binding",
+	"pages": "number_of_pages",
+	"page_count": "number_of_pages",
+	"pages_count": "number_of_pages",
+	"author_name": "author",
+	"model": "model_name",
+	"storage_capacity": "memory_storage_capacity",
+	"storage": "memory_storage_capacity",
+	"pack_size": "number_of_items",
+	"flavour": "flavor",
+	"material_type": "material",
+	"edition_name": "edition",
+	"style_name": "style",
 }
 
 TRANSIENT_SPAPI_CODES = {
@@ -115,6 +213,43 @@ class AmazonOutboundSync:
 				return curr
 		return COUNTRY_CURRENCIES.get(self.amz_setting.get("country"), "USD")
 
+	def get_language_tag(self) -> str:
+		country_code = str(self.amz_setting.get("country") or "").strip().upper()
+		return COUNTRY_LANGUAGE_TAGS.get(country_code, "en_US")
+
+	def build_purchasable_offer(
+		self, item, price: float, currency: str, marketplace_id: str
+	) -> list[dict]:
+		"""Build purchasable_offer payload, including Legal Metrology MRP for Amazon IN."""
+		offer: dict = {
+			"audience": "ALL",
+			"currency": currency,
+			"our_price": [{"schedule": [{"value_with_tax": flt(price)}]}],
+			"marketplace_id": marketplace_id,
+		}
+		is_india = currency == "INR" or str(self.amz_setting.get("country") or "").strip().upper() == "IN"
+		if is_india:
+			item_mrp = flt(getattr(item, "amazon_mrp", 0) if item is not None else 0)
+			mrp_val = item_mrp if item_mrp > 0 else flt(price)
+			offer["maximum_retail_price"] = [{"schedule": [{"value_with_tax": mrp_val}]}]
+		return [offer]
+
+	def resolve_merchant_suggested_asin(self, item, item_code: str, sku: str) -> str | None:
+		raw_asin = str(getattr(item, "amazon_asin", "") or "").strip().upper()
+		if len(raw_asin) == 10 and raw_asin.isalnum():
+			return raw_asin
+
+		integration = get_amazon_module_name()
+		ecom_asin = frappe.db.get_value(
+			"Ecommerce Item",
+			{"erpnext_item_code": item_code, "integration": ["in", [integration, "amazon"]]},
+			"integration_item_code",
+		)
+		candidate = str(ecom_asin or "").strip().upper()
+		if ASIN_PATTERN.match(candidate) and candidate != str(sku or "").strip().upper():
+			return candidate
+		return None
+
 	def resolve_item_code(self, item_code: str) -> str:
 		"""Resolve ERPNext Item code from Item name or mapped Amazon SKU/ASIN."""
 		if frappe.db.exists("Item", item_code):
@@ -167,6 +302,27 @@ class AmazonOutboundSync:
 			)
 			if item_pt and str(item_pt).strip():
 				return str(item_pt).strip()
+
+			variant_of = (
+				item.get("variant_of")
+				if isinstance(item, dict)
+				else getattr(item, "variant_of", None)
+			)
+			if variant_of:
+				parent_pt = frappe.db.get_value("Item", variant_of, "amazon_product_type")
+				if parent_pt and str(parent_pt).strip():
+					return str(parent_pt).strip()
+
+			ig = (
+				item.get("item_group")
+				if isinstance(item, dict)
+				else getattr(item, "item_group", None)
+			)
+			if ig:
+				ig_pt = frappe.db.get_value("Item Group", ig, "amazon_product_type")
+				if ig_pt and str(ig_pt).strip():
+					return str(ig_pt).strip()
+
 		return "PRODUCT"
 
 	def get_product_type_definition(
@@ -174,12 +330,13 @@ class AmazonOutboundSync:
 		product_type: str,
 		seller_id: str | None = None,
 		marketplace_id: str | None = None,
-		requirements: str = "LISTING",
+		requirements: str | None = None,
 	) -> dict:
 		"""Fetch and normalize ProductTypeDefinitions metadata for a product type."""
 		pt = (product_type or "PRODUCT").strip()
+		resolved_req = requirements or ("LISTING_OFFER_ONLY" if pt.upper() == "PRODUCT" else "LISTING")
 		mkt = self.get_marketplace_id(marketplace_id)
-		cache_key = (pt, mkt)
+		cache_key = (pt, mkt, resolved_req)
 		if cache_key in self._ptd_cache:
 			return self._ptd_cache[cache_key]
 
@@ -193,7 +350,7 @@ class AmazonOutboundSync:
 			product_type=pt,
 			marketplace_ids=[mkt],
 			seller_id=resolved_seller,
-			requirements=requirements,
+			requirements=resolved_req,
 		)
 		if isinstance(raw, dict) and "payload" in raw:
 			raw = raw.get("payload") or {}
@@ -216,6 +373,321 @@ class AmazonOutboundSync:
 		}
 		self._ptd_cache[cache_key] = definition
 		return definition
+
+	def _resolve_product_type_schema(self, product_type: str) -> dict:
+		"""Fetch and cache the JSON Schema for an Amazon product type."""
+		pt = (product_type or "PRODUCT").strip().upper()
+		if pt == "PRODUCT":
+			return {}
+
+		try:
+			defn = self.get_product_type_definition(pt) or {}
+		except Exception:
+			defn = {}
+
+		schema_url = defn.get("schemaLink")
+		schema: dict = {}
+		if schema_url:
+			cache_key = f"amz_pt_schema::{pt}"
+			cached = frappe.cache.get_value(cache_key) if hasattr(frappe, "cache") else None
+			if isinstance(cached, dict) and cached:
+				return cached
+			try:
+				resp = requests.get(schema_url, timeout=15)
+				if resp.status_code < 400:
+					schema = resp.json() or {}
+					if schema and hasattr(frappe, "cache"):
+						frappe.cache.set_value(cache_key, schema, expires_in_sec=3600)
+			except Exception:
+				schema = {}
+
+		if not schema:
+			schema = (defn.get("raw") or {}).get("schema") or {}
+		return schema
+
+	def build_attributes_template(self, product_type: str) -> dict:
+		"""Generate a schema-compliant JSON attributes template for an Amazon product type."""
+		pt = (product_type or "PRODUCT").strip().upper()
+		if pt == "PRODUCT":
+			return {}
+
+		schema = self._resolve_product_type_schema(pt)
+
+		props = schema.get("properties") or {}
+		req_set = set(schema.get("required") or [])
+		lang_tag = self.get_language_tag()
+
+		priority_fields = [
+			"item_type_name",
+			"model_name",
+			"model_number",
+			"color",
+			"author",
+			"binding",
+			"pages",
+			"publication_date",
+			"language",
+			"recommended_browse_nodes",
+			"product_tax_code",
+			"headphones_form_factor",
+			"connectivity_technology",
+			"included_components",
+			"bullet_point",
+			"batteries_required",
+			"number_of_items",
+			"unit_count",
+			"item_dimensions",
+			"base_product_mfg_warranty_period",
+			"warranty_provider_contact_information",
+			"steps_to_avail_mfg_warranty_description",
+			"base_product_mfg_warranty_tnc_description",
+		]
+
+		target_keys: list[str] = []
+		for k in priority_fields:
+			if k in props and k not in STANDARD_AUTO_ATTRS and k not in target_keys:
+				target_keys.append(k)
+
+		for k in sorted(req_set):
+			if k in props and k not in STANDARD_AUTO_ATTRS and k not in target_keys:
+				target_keys.append(k)
+
+		template: dict = {}
+		for key in target_keys:
+			prop = props.get(key) or {}
+			prop_type = prop.get("type")
+			items = prop.get("items") or {}
+			item_props = items.get("properties") or {}
+
+			if key == "product_tax_code":
+				template[key] = "A_GEN_NOTAX"
+				continue
+			if key == "batteries_required":
+				template[key] = False
+				continue
+			if key == "number_of_items":
+				template[key] = 1
+				continue
+			if key == "bullet_point":
+				template[key] = [
+					{"language_tag": lang_tag, "value": "Key feature 1"},
+					{"language_tag": lang_tag, "value": "Key feature 2"},
+				]
+				continue
+			if key == "item_dimensions":
+				template[key] = {
+					"length": {"unit": "centimeters", "value": 10.0},
+					"width": {"unit": "centimeters", "value": 10.0},
+					"height": {"unit": "centimeters", "value": 5.0},
+				}
+				continue
+			if key == "unit_count":
+				template[key] = {"value": 1, "type": {"language_tag": lang_tag, "value": "count"}}
+				continue
+			if key == "base_product_mfg_warranty_period":
+				template[key] = {"unit": "years", "value": 1}
+				continue
+			if key == "language" and "type" in item_props and "value" in item_props:
+				template[key] = {"type": "published", "value": "english"}
+				continue
+			if key == "pages":
+				template[key] = {"unit": "pages", "value": 100}
+				continue
+
+			if prop_type == "array" and items:
+				if "language_tag" in item_props and "value" in item_props:
+					val_prop = item_props.get("value") or {}
+					ex = val_prop.get("examples") or prop.get("examples")
+					val_ex = ex[0] if isinstance(ex, list) and ex else f"Enter {key.replace('_', ' ')}"
+					template[key] = {"language_tag": lang_tag, "value": val_ex}
+				elif "unit" in item_props and "value" in item_props:
+					unit_prop = item_props.get("unit") or {}
+					u_enums = unit_prop.get("enum") or []
+					unit_val = u_enums[0] if u_enums else "centimeters"
+					template[key] = {"unit": unit_val, "value": 1.0}
+				elif "value" in item_props:
+					val_prop = item_props.get("value") or {}
+					v_enums = val_prop.get("enum") or []
+					if v_enums:
+						template[key] = v_enums[0]
+					else:
+						ex = val_prop.get("examples") or prop.get("examples")
+						template[key] = ex[0] if isinstance(ex, list) and ex else ""
+				else:
+					template[key] = []
+			elif prop_type == "boolean":
+				template[key] = False
+			elif prop_type in ("integer", "number"):
+				template[key] = 1
+			elif "enum" in prop:
+				template[key] = prop["enum"][0]
+			else:
+				ex = prop.get("examples")
+				template[key] = ex[0] if isinstance(ex, list) and ex else ""
+
+		return template
+
+	def build_attributes_metadata(self, product_type: str, tmpl: dict | None = None) -> list[dict]:
+		"""Generate structured metadata for dynamic Desk input fields."""
+		pt = (product_type or "PRODUCT").strip().upper()
+		if pt == "PRODUCT":
+			return []
+
+		template = tmpl if tmpl is not None else self.build_attributes_template(pt)
+		if not isinstance(template, dict):
+			template = {}
+		schema = self._resolve_product_type_schema(pt)
+		props = schema.get("properties") or {}
+		req_set = set(schema.get("required") or [])
+
+		safe_default_keys = {
+			"product_tax_code",
+			"batteries_required",
+			"number_of_items",
+			"unit_count",
+			"language",
+			"base_product_mfg_warranty_period",
+		}
+		long_text_keys = {
+			"bullet_point",
+			"included_components",
+			"steps_to_avail_mfg_warranty_description",
+			"base_product_mfg_warranty_tnc_description",
+			"warranty_provider_contact_information",
+		}
+
+		fields_meta: list[dict] = []
+		for key, t_val in template.items():
+			prop = props.get(key) or {}
+			title = prop.get("title") or key.replace("_", " ").title()
+			prop_type = prop.get("type")
+			items = prop.get("items") or {}
+			item_props = items.get("properties") or {}
+
+			val_prop = item_props.get("value") if isinstance(item_props.get("value"), dict) else {}
+			val_format = val_prop.get("format") or prop.get("format")
+			desc = prop.get("description") or val_prop.get("description") or ""
+
+			enums = None
+			if "enum" in prop:
+				enums = prop["enum"]
+			elif "enum" in item_props:
+				enums = item_props["enum"]
+			elif "enum" in val_prop:
+				enums = val_prop["enum"]
+
+			if not enums:
+				if key == "binding":
+					enums = ["Paperback", "Hardcover", "Board Book", "Spiral Bound", "Mass Market Paperback", "Audiobook"]
+				elif key in ("headphones_form_factor", "form_factor"):
+					enums = ["Over Ear", "On Ear", "In Ear"]
+				elif key == "connectivity_technology":
+					enums = ["Wireless", "Bluetooth", "Wired", "NFC", "USB"]
+
+			unit = None
+			unit_options = None
+			if isinstance(t_val, dict) and "unit" in t_val:
+				unit = t_val["unit"]
+			elif "unit" in item_props:
+				u_enums = (item_props["unit"] or {}).get("enum") or []
+				if u_enums:
+					unit = u_enums[0]
+					unit_options = u_enums
+
+			if key == "item_dimensions" and not unit_options:
+				dim_len = ((item_props.get("length") or {}).get("properties") or {}).get("unit") or {}
+				unit_options = dim_len.get("enum") or ["centimeters", "millimeters", "inches", "meters"]
+
+			has_lang = False
+			if isinstance(t_val, dict) and "language_tag" in t_val:
+				has_lang = True
+			elif "language_tag" in item_props or "language_tag" in prop.get("properties", {}):
+				has_lang = True
+
+			widget_type = "standard"
+			if key == "item_dimensions":
+				widget_type = "dimensions"
+			elif key == "bullet_point":
+				widget_type = "bullet_list"
+			elif key == "unit_count":
+				widget_type = "unit_count"
+			elif key == "language" and isinstance(t_val, dict) and "type" in t_val:
+				widget_type = "language_obj"
+
+			is_scalar_wrapped = (
+				isinstance(t_val, dict)
+				and "value" in t_val
+				and set(t_val.keys()) <= {"value", "language_tag", "unit", "marketplace_id"}
+			)
+
+			if val_format == "date" or key in ("publication_date", "release_date", "first_available_date"):
+				ft = "Date"
+			elif val_format == "date-time":
+				ft = "Datetime"
+			elif prop_type == "boolean" or isinstance(t_val, bool) or val_prop.get("type") == "boolean":
+				ft = "Check"
+			elif enums and isinstance(enums, list) and 1 < len(enums) <= 50:
+				ft = "Select"
+			elif (
+				prop_type == "integer"
+				or val_prop.get("type") == "integer"
+				or (isinstance(t_val, int) and not isinstance(t_val, bool))
+				or (isinstance(t_val, dict) and isinstance(t_val.get("value"), int) and not isinstance(t_val.get("value"), bool))
+			):
+				ft = "Int"
+			elif (
+				prop_type == "number"
+				or val_prop.get("type") == "number"
+				or isinstance(t_val, float)
+				or (isinstance(t_val, dict) and isinstance(t_val.get("value"), float))
+			):
+				ft = "Float"
+			elif key in long_text_keys:
+				ft = "Small Text"
+			elif widget_type in ("dimensions", "language_obj"):
+				ft = "Data"
+			elif not is_scalar_wrapped and isinstance(t_val, (list, dict)):
+				ft = "Small Text"
+			else:
+				ft = "Data"
+
+			placeholder = ""
+			if widget_type == "bullet_list" and isinstance(t_val, list):
+				lines = [str(b.get("value", b) if isinstance(b, dict) else b) for b in t_val]
+				placeholder = "\n".join(line for line in lines if line)
+			elif widget_type == "dimensions":
+				placeholder = ""
+			elif isinstance(t_val, dict):
+				placeholder = str(t_val.get("value", ""))
+			elif isinstance(t_val, list):
+				placeholder = ", ".join(str(v.get("value", v) if isinstance(v, dict) else v) for v in t_val)
+			elif t_val is not None and not isinstance(t_val, bool):
+				placeholder = str(t_val)
+
+			options_str = None
+			if ft == "Select" and enums:
+				options_str = "\n" + "\n".join(str(e) for e in enums)
+
+			is_req = 1 if (key in req_set or key in ("author", "binding", "model_name", "item_type_name")) else 0
+
+			fields_meta.append({
+				"fieldname": key,
+				"label": title,
+				"fieldtype": ft,
+				"widget_type": widget_type,
+				"reqd": is_req,
+				"options": options_str,
+				"unit": unit,
+				"unit_options": unit_options,
+				"has_lang": has_lang,
+				"is_safe_default": key in safe_default_keys,
+				"placeholder": placeholder,
+				"description": desc,
+				"default": t_val,
+			})
+
+		fields_meta.sort(key=lambda x: (0 if x["reqd"] else 1, x["label"]))
+		return fields_meta
 
 	def get_uom_conversion_factor(self, item, target_uom: str | None = None) -> float:
 		"""Return stock_uom units per target UOM (e.g. 12 when selling by Box of 12)."""
@@ -286,13 +758,28 @@ class AmazonOutboundSync:
 		current_date = getdate(today())
 
 		if pl:
+			expected_currency = frappe.db.get_value("Price List", pl, "currency") or self.get_currency()
 			price_rows = frappe.get_all(
 				"Item Price",
 				filters={"item_code": item_code, "price_list": pl, "selling": 1},
-				fields=["price_list_rate", "uom", "valid_from", "valid_upto", "modified"],
+				fields=[
+					"price_list_rate",
+					"uom",
+					"valid_from",
+					"valid_upto",
+					"modified",
+					"customer",
+					"batch_no",
+					"packing_unit",
+					"currency",
+				],
 				order_by="modified desc",
 			)
-			valid_rows = [row for row in price_rows if _is_price_row_active(row, current_date)]
+			valid_rows = [
+				row
+				for row in price_rows
+				if _is_price_row_active(row, current_date, expected_currency=expected_currency)
+			]
 			chosen = _pick_best_price_row(valid_rows, target_uom, stock_uom)
 			if chosen and flt(chosen.get("price_list_rate")) > 0:
 				rate = flt(chosen.get("price_list_rate"))
@@ -407,6 +894,166 @@ class AmazonOutboundSync:
 		if last_exc:
 			raise last_exc
 
+	def build_listing_attributes(
+		self,
+		item,
+		item_code: str,
+		sku: str,
+		product_type: str,
+		stock_qty: float,
+		price: float,
+		currency: str,
+		marketplace_id: str,
+		barcodes: list[dict],
+	) -> dict:
+		"""Build SP-API Listings Items attribute dictionary from ERPNext Item and Settings."""
+		is_offer_only = product_type.upper() == "PRODUCT"
+		lang_tag = self.get_language_tag()
+
+		attributes: dict = {
+			"fulfillment_availability": [
+				{
+					"fulfillment_channel_code": "DEFAULT",
+					"quantity": int(max(0, flt(stock_qty))),
+				}
+			],
+		}
+		if is_offer_only:
+			attributes["condition_type"] = [{"value": "new_new", "marketplace_id": marketplace_id}]
+		else:
+			attributes["item_name"] = [
+				{"value": item.item_name or item.item_code, "marketplace_id": marketplace_id}
+			]
+			attributes["brand"] = [{"value": item.brand or "Generic", "marketplace_id": marketplace_id}]
+			if item.description:
+				attributes["product_description"] = [
+					{"value": strip_html(item.description).strip(), "marketplace_id": marketplace_id}
+				]
+			warranty = getattr(item, "warranty_period", None)
+			if warranty and str(warranty).strip():
+				w_text = str(warranty).strip()
+				if w_text.isdigit():
+					w_text = f"{w_text} days manufacturer warranty"
+				attributes["warranty_description"] = [
+					{"language_tag": lang_tag, "value": w_text, "marketplace_id": marketplace_id}
+				]
+
+		# Never publish an unintended 0.0 price offer when no positive selling price exists.
+		if flt(price) > 0:
+			attributes["purchasable_offer"] = self.build_purchasable_offer(
+				item, price=price, currency=currency, marketplace_id=marketplace_id
+			)
+
+		ident_attr = self.build_identifier_attribute(barcodes, marketplace_id)
+		if ident_attr:
+			attributes["externally_assigned_product_identifier"] = ident_attr
+
+		hsn_code = (
+			getattr(item, "gst_hsn_code", None)
+			or getattr(item, "customs_tariff_number", None)
+		)
+		if hsn_code and 4 <= len(str(hsn_code).strip()) <= 8:
+			attributes["external_product_information"] = [
+				{
+					"entity": "HSN Code",
+					"value": str(hsn_code).strip(),
+					"marketplace_id": marketplace_id,
+				}
+			]
+
+		asin = self.resolve_merchant_suggested_asin(item, item_code, sku)
+		if asin:
+			attributes["merchant_suggested_asin"] = [
+				{"value": asin, "marketplace_id": marketplace_id}
+			]
+
+		coo_iso = _resolve_country_iso2(
+			getattr(item, "country_of_origin", None)
+			or self.amz_setting.get("default_country_of_origin")
+		)
+		if coo_iso:
+			attributes["country_of_origin"] = [
+				{"value": coo_iso, "marketplace_id": marketplace_id}
+			]
+
+		weight_val = flt(getattr(item, "weight_per_unit", 0))
+		weight_unit = _resolve_amazon_weight_unit(getattr(item, "weight_uom", None))
+		if weight_val > 0 and weight_unit:
+			attributes["item_weight"] = [
+				{"unit": weight_unit, "value": weight_val, "marketplace_id": marketplace_id}
+			]
+
+		dg_reg = str(self.amz_setting.get("default_dg_regulation") or "").strip()
+		if dg_reg:
+			attributes["supplier_declared_dg_hz_regulation"] = [
+				{"value": dg_reg, "marketplace_id": marketplace_id}
+			]
+
+		packer_info = str(self.amz_setting.get("packer_contact_info") or "").strip()
+		if packer_info:
+			attributes["packer_contact_information"] = [
+				{"language_tag": lang_tag, "value": packer_info, "marketplace_id": marketplace_id}
+			]
+
+		importer_info = str(self.amz_setting.get("importer_contact_info") or "").strip()
+		if importer_info:
+			attributes["importer_contact_information"] = [
+				{"language_tag": lang_tag, "value": importer_info, "marketplace_id": marketplace_id}
+			]
+
+		# Schema marks additionalProperties=false with only "value" permitted on this field.
+		mfr_contact_info = str(self.amz_setting.get("manufacturer_contact_info") or "").strip()
+		if mfr_contact_info:
+			attributes["rtip_manufacturer_contact_information"] = [{"value": mfr_contact_info}]
+
+		manufacturer = (
+			getattr(item, "default_item_manufacturer", None)
+			or getattr(item, "manufacturer", None)
+		)
+		if not manufacturer and item_code:
+			manufacturer = frappe.db.get_value(
+				"Item Manufacturer", {"item_code": item_code, "is_default": 1}, "manufacturer"
+			) or frappe.db.get_value("Item Manufacturer", {"item_code": item_code}, "manufacturer")
+		if manufacturer and str(manufacturer).strip():
+			attributes["manufacturer"] = [
+				{
+					"language_tag": lang_tag,
+					"value": str(manufacturer).strip()[:100],
+					"marketplace_id": marketplace_id,
+				}
+			]
+
+		# Merge category/template defaults, item overrides, and variant axes (Item Group -> Template -> Item -> Variants tab)
+		item_group = item.get("item_group") if isinstance(item, dict) else getattr(item, "item_group", None)
+		variant_of = item.get("variant_of") if isinstance(item, dict) else getattr(item, "variant_of", None)
+
+		ig_attrs = _load_item_group_custom_attributes(item_group, variant_of, marketplace_id)
+		if ig_attrs:
+			attributes.update(ig_attrs)
+
+		if variant_of:
+			parent_attrs_raw = frappe.db.get_value("Item", variant_of, "amazon_attributes")
+			if parent_attrs_raw:
+				parent_custom_attrs = _parse_and_normalize_custom_attributes(
+					parent_attrs_raw, marketplace_id, str(variant_of)
+				)
+				if parent_custom_attrs:
+					attributes.update(parent_custom_attrs)
+
+		custom_attrs = _parse_and_normalize_custom_attributes(
+			item.get("amazon_attributes") if isinstance(item, dict) else getattr(item, "amazon_attributes", None),
+			marketplace_id,
+			item_code,
+		)
+		if custom_attrs:
+			attributes.update(custom_attrs)
+
+		variant_attrs = _map_variant_attributes(item, marketplace_id)
+		if variant_attrs:
+			attributes.update(variant_attrs)
+
+		return attributes
+
 	def create_or_update_listing(
 		self,
 		item_code: str,
@@ -429,36 +1076,20 @@ class AmazonOutboundSync:
 		price = flt(price_override) if price_override is not None else self.get_item_price(real_item_code)
 		barcodes = self.get_barcodes(real_item_code)
 
-		attributes: dict = {
-			"item_name": [{"value": item.item_name or item.item_code, "marketplace_id": marketplace_id}],
-			"brand": [{"value": item.brand or "Generic", "marketplace_id": marketplace_id}],
-			"fulfillment_availability": [
-				{
-					"fulfillment_channel_code": "DEFAULT",
-					"quantity": int(max(0, flt(stock_qty))),
-				}
-			],
-		}
-		if item.description:
-			attributes["product_description"] = [
-				{"value": strip_html(item.description).strip(), "marketplace_id": marketplace_id}
-			]
+		requirements = "LISTING_OFFER_ONLY" if p_type.upper() == "PRODUCT" else "LISTING"
+		attributes = self.build_listing_attributes(
+			item=item,
+			item_code=real_item_code,
+			sku=sku,
+			product_type=p_type,
+			stock_qty=stock_qty,
+			price=price,
+			currency=currency,
+			marketplace_id=marketplace_id,
+			barcodes=barcodes,
+		)
 
-		# Never publish an unintended 0.0 price offer when no positive selling price exists.
-		if flt(price) > 0:
-			attributes["purchasable_offer"] = [
-				{
-					"currency": currency,
-					"our_price": [{"schedule": [{"value_with_tax": flt(price)}]}],
-					"marketplace_id": marketplace_id,
-				}
-			]
-
-		ident_attr = self.build_identifier_attribute(barcodes, marketplace_id)
-		if ident_attr:
-			attributes["externally_assigned_product_identifier"] = ident_attr
-
-		payload = {"productType": p_type, "requirements": "LISTING", "attributes": attributes}
+		payload = {"productType": p_type, "requirements": requirements, "attributes": attributes}
 		retry_args = {"item_code": real_item_code, "amz_setting_name": getattr(self.amz_setting, "name", None)}
 
 		log = safe_create_amazon_log(
@@ -568,13 +1199,9 @@ class AmazonOutboundSync:
 				{
 					"op": "replace",
 					"path": "/attributes/purchasable_offer",
-					"value": [
-						{
-							"currency": currency,
-							"our_price": [{"schedule": [{"value_with_tax": flt(price)}]}],
-							"marketplace_id": marketplace_id,
-						}
-					],
+					"value": self.build_purchasable_offer(
+						item, price=price, currency=currency, marketplace_id=marketplace_id
+					),
 				}
 			)
 			sync_parts.append("item")
@@ -789,6 +1416,8 @@ def handle_item_update(doc, method=None) -> None:
 	if (
 		getattr(getattr(doc, "flags", None), "from_integration", False)
 		or frappe.flags.get("from_amazon_sync")
+		or frappe.flags.get("in_amazon_listing_sync")
+		or frappe.flags.get("from_amazon_fba_sync")
 		or frappe.flags.get("in_import")
 		or frappe.flags.in_patch
 	):
@@ -804,7 +1433,7 @@ def handle_item_update(doc, method=None) -> None:
 		fields=["name", "enable_sync", "enable_listings_sync"],
 	)
 	eligible = [
-		s for s in settings_list if frappe.utils.cint(s.enable_listings_sync) or frappe.utils.cint(s.enable_sync)
+		s for s in settings_list if frappe.utils.cint(s.enable_listings_sync)
 	]
 	if not eligible:
 		return
@@ -841,6 +1470,8 @@ def handle_item_trash(doc, method=None) -> None:
 	if (
 		getattr(getattr(doc, "flags", None), "from_integration", False)
 		or frappe.flags.get("from_amazon_sync")
+		or frappe.flags.get("in_amazon_listing_sync")
+		or frappe.flags.get("from_amazon_fba_sync")
 		or frappe.flags.in_patch
 	):
 		return
@@ -864,7 +1495,7 @@ def handle_item_trash(doc, method=None) -> None:
 		fields=["name", "enable_sync", "enable_listings_sync"],
 	)
 	eligible = [
-		s for s in settings_list if frappe.utils.cint(s.enable_listings_sync) or frappe.utils.cint(s.enable_sync)
+		s for s in settings_list if frappe.utils.cint(s.enable_listings_sync)
 	]
 
 	for ecom in ecom_rows:
@@ -990,6 +1621,102 @@ def get_amazon_product_type_definition(
 
 	repo = AmazonRepository(amz_setting_name)
 	return AmazonOutboundSync(repo).get_product_type_definition(product_type)
+
+
+@frappe.whitelist()
+def get_category_attributes_template(
+	product_type: str, amz_setting_name: str | None = None
+) -> dict:
+	frappe.has_permission("Item", "read", throw=True)
+	amz_setting_name = _resolve_setting_name(amz_setting_name)
+	frappe.has_permission("Amazon SP API Settings", "read", doc=amz_setting_name, throw=True)
+	from amazon_connector.amazon_ext.repository import (
+		CustomAmazonRepository as AmazonRepository,
+	)
+
+	repo = AmazonRepository(amz_setting_name)
+	sync = AmazonOutboundSync(repo)
+	tmpl = sync.build_attributes_template(product_type)
+	fields_meta = sync.build_attributes_metadata(product_type, tmpl=tmpl)
+	return {
+		"product_type": product_type,
+		"template": tmpl,
+		"fields_meta": fields_meta,
+		"json": json.dumps(tmpl, indent=2) if tmpl else "{}",
+	}
+
+
+@frappe.whitelist()
+def sync_amazon_product_types(amz_setting_name: str | None = None) -> dict:
+	frappe.has_permission("Amazon SP API Settings", "write", throw=True)
+	amz_setting_name = _resolve_setting_name(amz_setting_name)
+	from amazon_connector.amazon_ext.repository import (
+		CustomAmazonRepository as AmazonRepository,
+	)
+
+	repo = AmazonRepository(amz_setting_name)
+	sync = AmazonOutboundSync(repo)
+	if not hasattr(repo, "get_product_type_definitions_instance"):
+		frappe.throw(_("Product Type Definitions client is not available."))
+
+	ptd = repo.get_product_type_definitions_instance()
+	raw_mkt = sync.get_marketplace_id()
+	mkt = str(raw_mkt) if raw_mkt and isinstance(raw_mkt, str) else "A21TJRUUN4KGV"
+	raw = ptd.make_request(method="GET", append_to_base_uri="", params={"marketplaceIds": mkt})
+	pts = (raw or {}).get("productTypes") or []
+	if not pts:
+		return {"total": 0, "synced": 0, "marketplace_id": mkt}
+
+	curr_time = frappe.utils.now()
+	existing_names = set(frappe.get_all("Amazon Product Type", pluck="name"))
+	to_insert = []
+	synced = 0
+	for pt in pts:
+		pname = str(pt.get("name") or "").strip().upper()
+		if not pname:
+			continue
+		dname = str(pt.get("displayName") or pname).strip()
+		if pname in existing_names:
+			frappe.db.set_value(
+				"Amazon Product Type",
+				pname,
+				{"display_name": dname, "marketplace_id": mkt, "last_synced": curr_time},
+				update_modified=False,
+			)
+		else:
+			to_insert.append((
+				pname,
+				pname,
+				dname,
+				mkt,
+				curr_time,
+				"Administrator",
+				"Administrator",
+				curr_time,
+				curr_time,
+			))
+			existing_names.add(pname)
+		synced += 1
+
+	if to_insert:
+		frappe.db.bulk_insert(
+			"Amazon Product Type",
+			fields=[
+				"name",
+				"product_type",
+				"display_name",
+				"marketplace_id",
+				"last_synced",
+				"owner",
+				"modified_by",
+				"creation",
+				"modified",
+			],
+			values=to_insert,
+		)
+	if not frappe.flags.in_test:
+		frappe.db.commit()
+	return {"total": len(pts), "synced": synced, "marketplace_id": mkt}
 
 
 def get_expanded_warehouses(warehouses: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -1198,8 +1925,16 @@ def _classify_product_identifier(val: str, raw_type: str) -> tuple[str, bool] | 
 	return None
 
 
-def _is_price_row_active(row: dict, current_date) -> bool:
+def _is_price_row_active(row: dict, current_date, expected_currency: str | None = None) -> bool:
 	if flt(row.get("price_list_rate")) <= 0:
+		return False
+	if row.get("customer"):
+		return False
+	if row.get("batch_no"):
+		return False
+	if flt(row.get("packing_unit") or row.get("min_qty") or 0) > 1.0:
+		return False
+	if expected_currency and row.get("currency") and row.get("currency") != expected_currency:
 		return False
 	valid_from = row.get("valid_from")
 	valid_upto = row.get("valid_upto")
@@ -1257,3 +1992,117 @@ def _clear_or_mark_deleted_ecommerce_item(
 			frappe.delete_doc("Ecommerce Item", name, force=1, ignore_permissions=True)
 		elif frappe.db.has_column("Ecommerce Item", "status"):
 			frappe.db.set_value("Ecommerce Item", name, "status", "Deleted")
+
+
+def _resolve_country_iso2(country_val: str | None) -> str | None:
+	if not country_val:
+		return None
+	cleaned = str(country_val).strip()
+	if not cleaned:
+		return None
+	if len(cleaned) == 2 and cleaned.isalpha():
+		return cleaned.upper()
+	code = frappe.db.get_value("Country", cleaned, "code")
+	if code and len(str(code).strip()) == 2:
+		return str(code).strip().upper()
+	return None
+
+
+def _resolve_amazon_weight_unit(uom: str | None) -> str | None:
+	if not uom:
+		return None
+	return AMAZON_WEIGHT_UNIT_MAP.get(str(uom).strip().lower())
+
+
+def _normalize_attribute_entry(attr_key: str, item_val, marketplace_id: str) -> dict | None:
+	if item_val is None:
+		return None
+	if isinstance(item_val, dict):
+		entry = dict(item_val)
+	elif isinstance(item_val, (str, int, float, bool)):
+		if isinstance(item_val, str) and not item_val.strip():
+			return None
+		entry = {"value": item_val}
+	else:
+		return None
+
+	if attr_key not in NO_MARKETPLACE_ID_ATTRS and "marketplace_id" not in entry:
+		entry["marketplace_id"] = marketplace_id
+	return entry
+
+
+def _parse_and_normalize_custom_attributes(raw_attrs, marketplace_id: str, item_code: str) -> dict:
+	if not raw_attrs:
+		return {}
+
+	if isinstance(raw_attrs, str):
+		raw_text = raw_attrs.strip()
+		if not raw_text:
+			return {}
+		try:
+			parsed = json.loads(raw_text)
+		except json.JSONDecodeError as exc:
+			frappe.throw(_("Invalid JSON in Amazon Attributes on Item {0}: {1}").format(item_code, exc))
+	elif isinstance(raw_attrs, dict):
+		parsed = raw_attrs
+	else:
+		frappe.throw(_("Amazon Attributes on Item {0} must be a JSON object.").format(item_code))
+
+	if not isinstance(parsed, dict):
+		frappe.throw(_("Amazon Attributes on Item {0} must be a JSON object.").format(item_code))
+
+	normalized: dict = {}
+	for attr_key, attr_val in parsed.items():
+		if not isinstance(attr_key, str) or not attr_key.strip() or attr_val is None:
+			continue
+		key = attr_key.strip()
+		raw_entries = attr_val if isinstance(attr_val, list) else [attr_val]
+		entries = []
+		for raw_entry in raw_entries:
+			entry = _normalize_attribute_entry(key, raw_entry, marketplace_id)
+			if entry is not None:
+				entries.append(entry)
+		if entries:
+			normalized[key] = entries
+
+	return normalized
+
+
+def _load_item_group_custom_attributes(
+	item_group: str | None, variant_of: str | None, marketplace_id: str
+) -> dict:
+	"""Load and normalize category-level Amazon attributes template from the Item Group."""
+	ig = item_group
+	if not ig and variant_of:
+		ig = frappe.db.get_value("Item", variant_of, "item_group")
+	if not ig or not frappe.db.has_column("Item Group", "amazon_attributes_template"):
+		return {}
+
+	ig_attrs_raw = frappe.db.get_value("Item Group", ig, "amazon_attributes_template")
+	if not ig_attrs_raw:
+		return {}
+	return _parse_and_normalize_custom_attributes(ig_attrs_raw, marketplace_id, f"Item Group {ig}")
+
+
+def _map_variant_attributes(item, marketplace_id: str) -> dict:
+	"""Map ERPNext Item Variant Attributes rows to normalized Amazon listing attributes."""
+	rows = item.get("attributes") if isinstance(item, dict) else getattr(item, "attributes", None)
+	if not rows:
+		return {}
+
+	mapped: dict = {}
+	for row in rows:
+		attr_name = row.get("attribute") if isinstance(row, dict) else getattr(row, "attribute", None)
+		attr_val = row.get("attribute_value") if isinstance(row, dict) else getattr(row, "attribute_value", None)
+		if not attr_name or attr_val is None or not str(attr_val).strip():
+			continue
+
+		val_str = str(attr_val).strip()
+		raw_name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(attr_name).strip().lower()).strip("_")
+		norm_key = VARIANT_ATTRIBUTE_ALIASES.get(raw_name, raw_name)
+		coerced_val: object = int(val_str) if (norm_key == "number_of_items" and val_str.isdigit()) else val_str
+		entry = _normalize_attribute_entry(norm_key, coerced_val, marketplace_id)
+		if entry:
+			mapped[norm_key] = [entry]
+
+	return mapped

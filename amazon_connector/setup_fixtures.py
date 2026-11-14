@@ -8,6 +8,10 @@ EXT_MODULE = "Amazon Connector"
 DEPRECATED_CUSTOM_FIELDS = (
 	"Sales Order-amazon_fulfillment_channel",
 	"Delivery Note-amazon_fulfillment_channel",
+	"Item-amazon_tab",
+	"Item-amazon_section",
+	"Item-amazon_col_break",
+	"Item-amazon_details_col_break",
 )
 
 CUSTOM_FIELDS: dict[str, list[dict]] = {
@@ -41,6 +45,57 @@ CUSTOM_FIELDS: dict[str, list[dict]] = {
 			"options": "Warehouse",
 			"insert_after": "warehouse",
 			"description": "Warehouse used for Amazon Fulfilled (AFN / FBA) orders and Delivery Notes (falls back to default Warehouse if blank).",
+		},
+		{
+			"fieldname": "compliance_defaults_section",
+			"label": "Listing & Compliance Defaults",
+			"fieldtype": "Section Break",
+			"collapsible": 1,
+			"insert_after": "market_place_account_group",
+			"description": "Default India/SP-API listing compliance attributes applied when pushing items.",
+		},
+		{
+			"fieldname": "default_country_of_origin",
+			"label": "Default Country of Origin",
+			"fieldtype": "Link",
+			"options": "Country",
+			"insert_after": "compliance_defaults_section",
+			"description": "Fallback Country of Origin used when Item.country_of_origin is blank.",
+		},
+		{
+			"fieldname": "default_dg_regulation",
+			"label": "Default Dangerous Goods Regulation",
+			"fieldtype": "Select",
+			"options": "\nnot_applicable\nghs\nstorage\ntransportation\nwaste\nother\nunknown",
+			"default": "not_applicable",
+			"insert_after": "default_country_of_origin",
+			"description": "Default Amazon supplier_declared_dg_hz_regulation value for pushed listings.",
+		},
+		{
+			"fieldname": "column_break_compliance",
+			"fieldtype": "Column Break",
+			"insert_after": "default_dg_regulation",
+		},
+		{
+			"fieldname": "packer_contact_info",
+			"label": "Packer Contact Information",
+			"fieldtype": "Small Text",
+			"insert_after": "column_break_compliance",
+			"description": "Default Legal Metrology packer name & address for Amazon IN listings.",
+		},
+		{
+			"fieldname": "importer_contact_info",
+			"label": "Importer Contact Information",
+			"fieldtype": "Small Text",
+			"insert_after": "packer_contact_info",
+			"description": "Default Legal Metrology importer name & address for Amazon IN listings.",
+		},
+		{
+			"fieldname": "manufacturer_contact_info",
+			"label": "Manufacturer Contact Information",
+			"fieldtype": "Small Text",
+			"insert_after": "importer_contact_info",
+			"description": "Default manufacturer contact details (rtip_manufacturer_contact_information) for Amazon listings.",
 		},
 		{
 			"fieldname": "enable_rdt_pii",
@@ -187,13 +242,97 @@ CUSTOM_FIELDS: dict[str, list[dict]] = {
 			"insert_after": "last_returns_sync",
 		},
 	],
+	"Item Group": [
+		{
+			"fieldname": "amazon_section",
+			"label": "Amazon SP-API Defaults",
+			"fieldtype": "Section Break",
+			"collapsible": 1,
+			"insert_after": "defaults",
+		},
+		{
+			"fieldname": "amazon_product_type",
+			"label": "Default Amazon Product Type",
+			"fieldtype": "Link",
+			"options": "Amazon Product Type",
+			"insert_after": "amazon_section",
+			"description": "Default Amazon category applied when creating items in this group.",
+		},
+		{
+			"fieldname": "amazon_attributes_template",
+			"label": "Amazon Attributes Template (JSON)",
+			"fieldtype": "Code",
+			"options": "JSON",
+			"insert_after": "amazon_product_type",
+			"description": "Default category-specific Amazon attributes template preloaded for items in this group.",
+		},
+	],
 	"Item": [
 		{
 			"fieldname": "amazon_product_type",
 			"label": "Amazon Product Type",
-			"fieldtype": "Data",
+			"fieldtype": "Link",
+			"options": "Amazon Product Type",
 			"insert_after": "item_group",
 			"print_hide": 1,
+			"description": "Select from 1,859 official Amazon India categories (e.g. Printed Book, Headphones).",
+		},
+		{
+			"fieldname": "amazon_asin",
+			"label": "Amazon ASIN",
+			"fieldtype": "Data",
+			"insert_after": "amazon_product_type",
+			"print_hide": 1,
+			"description": "10-character Amazon Standard Identification Number mapped to merchant_suggested_asin.",
+		},
+		{
+			"fieldname": "amazon_details_col_break",
+			"fieldtype": "Column Break",
+			"insert_after": "amazon_asin",
+		},
+		{
+			"fieldname": "amazon_mrp",
+			"label": "Amazon MRP",
+			"fieldtype": "Currency",
+			"insert_after": "amazon_details_col_break",
+			"print_hide": 1,
+			"description": "Maximum Retail Price for Amazon IN listings (falls back to selling price if zero).",
+		},
+		{
+			"fieldname": "amazon_attributes_tab",
+			"label": "Amazon Attributes",
+			"fieldtype": "Tab Break",
+			"insert_after": "description",
+		},
+		{
+			"fieldname": "amazon_attrs_section",
+			"label": "Amazon Category Attributes",
+			"fieldtype": "Section Break",
+			"insert_after": "amazon_attributes_tab",
+			"description": "Category-specific listing attributes dynamically generated from Amazon schema.",
+		},
+		{
+			"fieldname": "amazon_dynamic_attributes_html",
+			"label": "Category Attributes Form",
+			"fieldtype": "HTML",
+			"insert_after": "amazon_attrs_section",
+		},
+		{
+			"fieldname": "amazon_raw_json_section",
+			"label": "Raw JSON Payload",
+			"fieldtype": "Section Break",
+			"collapsible": 1,
+			"collapsed": 1,
+			"insert_after": "amazon_dynamic_attributes_html",
+		},
+		{
+			"fieldname": "amazon_attributes",
+			"label": "Amazon Attributes (JSON)",
+			"fieldtype": "Code",
+			"options": "JSON",
+			"insert_after": "amazon_raw_json_section",
+			"print_hide": 1,
+			"description": "JSON object of category-specific Amazon SP-API attributes. Kept in sync with dynamic fields.",
 		},
 	],
 	"Ecommerce Item": [
@@ -414,11 +553,98 @@ PROPERTY_SETTERS: list[dict] = [
 	},
 ]
 
+DEFAULT_ITEM_ATTRIBUTES = [
+	{
+		"attribute_name": "Color",
+		"values": [
+			("Black", "BLK"),
+			("White", "WHT"),
+			("Blue", "BLU"),
+			("Red", "RED"),
+			("Green", "GRN"),
+			("Grey", "GRY"),
+			("Silver", "SLV"),
+			("Gold", "GLD"),
+			("Pink", "PNK"),
+			("Yellow", "YLW"),
+		],
+	},
+	{
+		"attribute_name": "Size",
+		"values": [
+			("XS", "XS"),
+			("S", "S"),
+			("M", "M"),
+			("L", "L"),
+			("XL", "XL"),
+			("XXL", "XXL"),
+			("Free Size", "FREE"),
+		],
+	},
+	{
+		"attribute_name": "Binding",
+		"values": [
+			("Paperback", "PB"),
+			("Hardcover", "HC"),
+			("Board Book", "BB"),
+			("Spiral Bound", "SB"),
+		],
+	},
+	{
+		"attribute_name": "Storage Capacity",
+		"values": [
+			("32 GB", "32G"),
+			("64 GB", "64G"),
+			("128 GB", "128G"),
+			("256 GB", "256G"),
+			("512 GB", "512G"),
+			("1 TB", "1TB"),
+		],
+	},
+	{
+		"attribute_name": "Pack Size",
+		"values": [
+			("1", "PK1"),
+			("2", "PK2"),
+			("3", "PK3"),
+			("5", "PK5"),
+			("10", "PK10"),
+		],
+	},
+]
+
+
+def _seed_default_item_attributes() -> None:
+	"""Seed starter ERPNext Item Attributes for common Amazon variation axes without overwriting existing ones."""
+	if not frappe.db.table_exists("Item Attribute"):
+		return
+
+	for attr_def in DEFAULT_ITEM_ATTRIBUTES:
+		attr_name = attr_def["attribute_name"]
+		if frappe.db.exists("Item Attribute", attr_name):
+			continue
+		doc = frappe.get_doc(
+			{
+				"doctype": "Item Attribute",
+				"attribute_name": attr_name,
+				"numeric_values": 0,
+				"item_attribute_values": [
+					{"attribute_value": val, "abbr": abbr} for val, abbr in attr_def["values"]
+				],
+			}
+		)
+		doc.insert(ignore_permissions=True)
+
 
 def _upsert_custom_field(dt: str, df: dict) -> None:
 	name = f"{dt}-{df['fieldname']}"
 	if frappe.db.exists("Custom Field", name):
 		doc = frappe.get_doc("Custom Field", name)
+		if df.get("fieldtype") and doc.fieldtype != df["fieldtype"]:
+			frappe.delete_doc("Custom Field", name, force=1)
+			doc = frappe.get_doc({"doctype": "Custom Field", "dt": dt, "module": EXT_MODULE, **df})
+			doc.insert(ignore_permissions=True)
+			return
 		dirty = False
 		for key, val in {**df, "module": EXT_MODULE}.items():
 			if doc.get(key) != val:
@@ -510,3 +736,4 @@ def sync_amazon_extensions_fixtures():
 		_upsert_property_setter(ps_def)
 
 	_drop_amazon_fields_map_unique_indexes()
+	_seed_default_item_attributes()

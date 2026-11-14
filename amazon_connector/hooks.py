@@ -12,6 +12,7 @@ doctype_js = {
 	"Sales Order": "public/js/amazon/sales_order.js",
 	"Delivery Note": "public/js/amazon/delivery_note.js",
 	"Item": "public/js/amazon/item.js",
+	"Item Group": "public/js/amazon/item_group.js",
 }
 
 doctype_list_js = {
@@ -42,7 +43,11 @@ doc_events = {
 		"on_trash": "amazon_connector.amazon_ext.outbound.handle_item_trash",
 	},
 	"Sales Order": {
-		"on_cancel": "amazon_connector.amazon_ext.lifecycle.handle_sales_order_cancel",
+		"on_submit": "amazon_connector.amazon_ext.fulfillment.handle_sales_order_stock_reservation",
+		"on_cancel": [
+			"amazon_connector.amazon_ext.lifecycle.handle_sales_order_cancel",
+			"amazon_connector.amazon_ext.fulfillment.handle_sales_order_stock_reservation",
+		],
 	},
 	"Item Price": {
 		"on_update": "amazon_connector.amazon_ext.fulfillment.handle_item_price_change",

@@ -106,6 +106,7 @@ class CustomAmazonSPAPISettings(_BaseAmazonSPAPISettings):
 			queue="long",
 			amz_setting_name=self.name,
 			created_after=self.after_date,
+			last_updated_after=self.get("last_orders_sync"),
 		)
 
 	@frappe.whitelist()
@@ -120,6 +121,7 @@ class CustomAmazonSPAPISettings(_BaseAmazonSPAPISettings):
 			queue="long",
 			amz_setting_name=self.name,
 			created_after=self.after_date,
+			last_updated_after=self.get("last_delivery_notes_sync"),
 		)
 
 	@frappe.whitelist()
@@ -146,7 +148,7 @@ class CustomAmazonSPAPISettings(_BaseAmazonSPAPISettings):
 			queued_message=_("Customer returns and refunds will be fetched in the background."),
 			queue="long",
 			amz_setting_name=self.name,
-			posted_after=self.after_date,
+			posted_after=self.get("last_returns_sync") or self.after_date,
 		)
 
 	@frappe.whitelist()
@@ -160,7 +162,7 @@ class CustomAmazonSPAPISettings(_BaseAmazonSPAPISettings):
 			queued_message=_("Settlement entries will be synced in the background."),
 			queue="long",
 			amz_setting_name=self.name,
-			started_after=self.after_date,
+			started_after=self.get("last_settlements_sync") or self.after_date,
 		)
 
 
@@ -209,7 +211,8 @@ def schedule_get_delivery_notes():
 	_run_scheduled_for_settings(
 		{"is_active": 1, "enable_sync": 1, "sync_delivery_notes": 1},
 		get_delivery_notes,
-		created_after=lambda s: s.get("last_delivery_notes_sync") or s.after_date,
+		created_after=lambda s: s.after_date,
+		last_updated_after=lambda s: s.get("last_delivery_notes_sync") or s.after_date,
 	)
 
 
@@ -246,6 +249,7 @@ def schedule_get_listings():
 def sync_from_listview(doctype: str) -> dict:
 	"""Fetch delta orders or delivery notes from Amazon when List View refresh button is clicked."""
 	frappe.has_permission(doctype, "read", throw=True)
+	frappe.has_permission(doctype, "write", throw=True)
 	if doctype == "Sales Order":
 		schedule_get_order_details()
 		return {
