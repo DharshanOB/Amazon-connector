@@ -76,8 +76,8 @@ function map_variant_attributes_to_controls(frm, notify = false) {
 		const target_keys = [raw_name, VARIANT_TO_AMAZON_ALIASES[raw_name] || null].filter(Boolean);
 		for (const key of target_keys) {
 			if (frm._amz_controls[key]) {
-				const ctrl = frm._amz_controls[key].control;
-				ctrl.set_value(val);
+				const entry = frm._amz_controls[key];
+				entry.control.set_value(resolve_select_option_value(val, entry.meta));
 				mapped_count++;
 				mapped_names.push(`${row.attribute} ➔ ${key}`);
 				break;
@@ -209,6 +209,35 @@ function ensure_amazon_attribute_styles() {
 			}
 		}
 	</style>`).appendTo("head");
+}
+
+function resolve_select_option_value(val, meta) {
+	if (val === null || val === undefined || !meta || meta.fieldtype !== "Select") {
+		return val;
+	}
+	const str_val = String(val).trim();
+	if (!str_val) return val;
+
+	let opts = [];
+	if (Array.isArray(meta.options)) {
+		opts = meta.options.map((o) =>
+			typeof o === "object" && o !== null ? o : { label: String(o), value: String(o) }
+		);
+	} else if (typeof meta.options === "string") {
+		opts = meta.options
+			.split("\n")
+			.filter(Boolean)
+			.map((o) => ({ label: o, value: o }));
+	}
+	if (!opts.length) return val;
+
+	const exact = opts.find((o) => o.value === str_val);
+	if (exact) return exact.value;
+
+	const norm = (s) => String(s || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+	const target = norm(str_val);
+	const matched = opts.find((o) => norm(o.value) === target || norm(o.label) === target);
+	return matched ? matched.value : val;
 }
 
 function build_safe_defaults_payload(fields_meta) {
@@ -549,7 +578,7 @@ function render_amazon_dynamic_attributes(frm, force_reload = false) {
 					frm.doc.amazon_attributes &&
 					frm.doc.amazon_attributes.trim() !== "" &&
 					frm.doc.amazon_attributes.trim() !== "{}";
-				if (!has_attrs) {
+				if (!has_attrs && (frm.is_new() || frm.is_dirty())) {
 					const safe_defaults = build_safe_defaults_payload(frm._amz_fields_meta);
 					if (Object.keys(safe_defaults).length > 0) {
 						frm.set_value("amazon_attributes", JSON.stringify(safe_defaults, null, 2));
@@ -639,8 +668,11 @@ function build_attribute_controls(frm, $wrapper, fields_meta) {
 	}
 
 	let is_syncing = false;
+	let is_initializing = true;
+	const init_promises = [];
+
 	function sync_dynamic_controls_to_doc() {
-		if (is_syncing) return;
+		if (is_syncing || is_initializing) return;
 		is_syncing = true;
 		try {
 			let payload = {};
@@ -678,15 +710,22 @@ function build_attribute_controls(frm, $wrapper, fields_meta) {
 
 	$header.find(".btn-fill-amz-samples").on("click", function (e) {
 		e.preventDefault();
+		is_syncing = true;
+		const sample_promises = [];
 		Object.keys(frm._amz_controls || {}).forEach((k) => {
 			const entry = frm._amz_controls[k];
 			const display_val = extract_control_display_value(entry.meta.default, entry.meta);
 			if (display_val !== null && display_val !== undefined && display_val !== "") {
-				entry.control.set_value(display_val);
+				sample_promises.push(
+					Promise.resolve(entry.control.set_value(resolve_select_option_value(display_val, entry.meta)))
+				);
 			}
 		});
-		sync_dynamic_controls_to_doc();
-		frappe.show_alert({ message: __("Populated schema sample values."), indicator: "blue" });
+		Promise.all(sample_promises).finally(() => {
+			is_syncing = false;
+			sync_dynamic_controls_to_doc();
+			frappe.show_alert({ message: __("Populated schema sample values."), indicator: "blue" });
+		});
 	});
 
 	$header.find(".btn-reset-amz-defaults").on("click", function (e) {
@@ -749,7 +788,9 @@ function build_attribute_controls(frm, $wrapper, fields_meta) {
 			}
 
 			if (initial_val !== undefined && initial_val !== null && initial_val !== "") {
-				control.set_value(initial_val);
+				init_promises.push(
+					Promise.resolve(control.set_value(resolve_select_option_value(initial_val, meta)))
+				);
 			}
 
 			frm._amz_controls[meta.fieldname] = { control: control, meta: meta };
@@ -761,8 +802,11 @@ function build_attribute_controls(frm, $wrapper, fields_meta) {
 
 	frm._amz_sync_fn = sync_dynamic_controls_to_doc;
 
-	// Automatically map any existing variant attributes from Variants tab
-	map_variant_attributes_to_controls(frm, false);
+	Promise.all(init_promises).finally(() => {
+		is_initializing = false;
+		// Automatically map any existing variant attributes from Variants tab
+		map_variant_attributes_to_controls(frm, false);
+	});
 }
 
 frappe.ui.form.on("Item", {

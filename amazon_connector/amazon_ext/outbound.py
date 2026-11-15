@@ -497,8 +497,12 @@ class AmazonOutboundSync:
 			if prop_type == "array" and items:
 				if "language_tag" in item_props and "value" in item_props:
 					val_prop = item_props.get("value") or {}
-					ex = val_prop.get("examples") or prop.get("examples")
-					val_ex = ex[0] if isinstance(ex, list) and ex else f"Enter {key.replace('_', ' ')}"
+					v_enums = val_prop.get("enum") or prop.get("enum") or []
+					ex = prop.get("examples") or val_prop.get("examples")
+					if v_enums:
+						val_ex = _match_enum_example(v_enums, ex[0] if isinstance(ex, list) and ex else None)
+					else:
+						val_ex = ex[0] if isinstance(ex, list) and ex else f"Enter {key.replace('_', ' ')}"
 					template[key] = {"language_tag": lang_tag, "value": val_ex}
 				elif "unit" in item_props and "value" in item_props:
 					unit_prop = item_props.get("unit") or {}
@@ -508,10 +512,10 @@ class AmazonOutboundSync:
 				elif "value" in item_props:
 					val_prop = item_props.get("value") or {}
 					v_enums = val_prop.get("enum") or []
+					ex = prop.get("examples") or val_prop.get("examples")
 					if v_enums:
-						template[key] = v_enums[0]
+						template[key] = _match_enum_example(v_enums, ex[0] if isinstance(ex, list) and ex else None)
 					else:
-						ex = val_prop.get("examples") or prop.get("examples")
 						template[key] = ex[0] if isinstance(ex, list) and ex else ""
 				else:
 					template[key] = []
@@ -568,21 +572,18 @@ class AmazonOutboundSync:
 			val_format = val_prop.get("format") or prop.get("format")
 			desc = prop.get("description") or val_prop.get("description") or ""
 
-			enums = None
-			if "enum" in prop:
-				enums = prop["enum"]
-			elif "enum" in item_props:
-				enums = item_props["enum"]
-			elif "enum" in val_prop:
-				enums = val_prop["enum"]
+			enums, enum_names = _extract_schema_enums(prop, item_props, val_prop)
 
 			if not enums:
 				if key == "binding":
-					enums = ["Paperback", "Hardcover", "Board Book", "Spiral Bound", "Mass Market Paperback", "Audiobook"]
+					enums = ["paperback", "hardcover", "board_book", "spiral_bound", "mass_market", "audiobook"]
+					enum_names = ["Paperback", "Hardcover", "Board Book", "Spiral Bound", "Mass Market Paperback", "Audiobook"]
 				elif key in ("headphones_form_factor", "form_factor"):
-					enums = ["Over Ear", "On Ear", "In Ear"]
+					enums = ["over_ear", "on_ear", "in_ear"]
+					enum_names = ["Over Ear", "On Ear", "In Ear"]
 				elif key == "connectivity_technology":
 					enums = ["Wireless", "Bluetooth", "Wired", "NFC", "USB"]
+					enum_names = None
 
 			unit = None
 			unit_options = None
@@ -626,7 +627,7 @@ class AmazonOutboundSync:
 				ft = "Datetime"
 			elif prop_type == "boolean" or isinstance(t_val, bool) or val_prop.get("type") == "boolean":
 				ft = "Check"
-			elif enums and isinstance(enums, list) and 1 < len(enums) <= 50:
+			elif enums and isinstance(enums, list) and 1 < len(enums) <= 250:
 				ft = "Select"
 			elif (
 				prop_type == "integer"
@@ -664,9 +665,18 @@ class AmazonOutboundSync:
 			elif t_val is not None and not isinstance(t_val, bool):
 				placeholder = str(t_val)
 
-			options_str = None
+			if key == "recommended_browse_nodes":
+				node_ex = placeholder if placeholder.isdigit() else "3732888211"
+				placeholder = f"e.g. {node_ex} (Browse Node ID)"
+
+			options_val: str | list | None = None
 			if ft == "Select" and enums:
-				options_str = "\n" + "\n".join(str(e) for e in enums)
+				if enum_names and isinstance(enum_names, list) and len(enum_names) == len(enums):
+					options_val = [{"label": "", "value": ""}] + [
+						{"label": str(lbl), "value": str(val)} for val, lbl in zip(enums, enum_names)
+					]
+				else:
+					options_val = "\n" + "\n".join(str(e) for e in enums)
 
 			is_req = 1 if (key in req_set or key in ("author", "binding", "model_name", "item_type_name")) else 0
 
@@ -676,7 +686,7 @@ class AmazonOutboundSync:
 				"fieldtype": ft,
 				"widget_type": widget_type,
 				"reqd": is_req,
-				"options": options_str,
+				"options": options_val,
 				"unit": unit,
 				"unit_options": unit_options,
 				"has_lang": has_lang,
@@ -2100,9 +2110,39 @@ def _map_variant_attributes(item, marketplace_id: str) -> dict:
 		val_str = str(attr_val).strip()
 		raw_name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(attr_name).strip().lower()).strip("_")
 		norm_key = VARIANT_ATTRIBUTE_ALIASES.get(raw_name, raw_name)
-		coerced_val: object = int(val_str) if (norm_key == "number_of_items" and val_str.isdigit()) else val_str
+		coerced_val: object = val_str
+		if norm_key == "number_of_items" and val_str.isdigit():
+			coerced_val = int(val_str)
+		elif norm_key == "binding" and (" " in val_str or val_str.istitle()):
+			coerced_val = re.sub(r"\s+", "_", val_str.lower())
 		entry = _normalize_attribute_entry(norm_key, coerced_val, marketplace_id)
 		if entry:
 			mapped[norm_key] = [entry]
 
 	return mapped
+
+
+def _extract_schema_enums(prop: dict, item_props: dict, val_prop: dict) -> tuple[list | None, list | None]:
+	"""Return (enum_values, enum_labels) from the first schema level defining an enum."""
+	for node in (prop, item_props, val_prop):
+		if isinstance(node, dict) and isinstance(node.get("enum"), list) and node["enum"]:
+			enum_names = node.get("enumNames") if isinstance(node.get("enumNames"), list) else None
+			return node["enum"], enum_names
+	return None, None
+
+
+def _match_enum_example(enums: list, example_val) -> object:
+	"""Pick the enum value matching an example string (exact or normalized), falling back to enums[0]."""
+	if not enums:
+		return example_val or ""
+	if example_val is None:
+		return enums[0]
+	if example_val in enums:
+		return example_val
+
+	norm_target = re.sub(r"[^a-z0-9]+", "_", str(example_val).strip().lower()).strip("_")
+	for candidate in enums:
+		norm_cand = re.sub(r"[^a-z0-9]+", "_", str(candidate).strip().lower()).strip("_")
+		if norm_cand == norm_target:
+			return candidate
+	return enums[0]

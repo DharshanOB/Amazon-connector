@@ -719,6 +719,16 @@ class TestAmazonOutbound(IntegrationTestCase):
 								},
 							},
 						},
+						"recommended_browse_nodes": {
+							"type": "array",
+							"examples": ["3732888211"],
+							"items": {
+								"type": "object",
+								"properties": {
+									"value": {"type": "string", "examples": ["Diet Bars"]},
+								},
+							},
+						},
 					},
 				}
 			},
@@ -727,6 +737,7 @@ class TestAmazonOutbound(IntegrationTestCase):
 			tmpl = outbound.build_attributes_template("HEADPHONES")
 			self.assertIn("color", tmpl)
 			self.assertEqual(tmpl["color"], {"language_tag": "en_IN", "value": "Matte Black"})
+			self.assertEqual(tmpl["recommended_browse_nodes"], "3732888211")
 			self.assertIn("model_name", tmpl)
 			self.assertIn("unit_count", tmpl)
 			self.assertIn("item_dimensions", tmpl)
@@ -807,6 +818,7 @@ class TestAmazonOutbound(IntegrationTestCase):
 				"bullet_point": [{"language_tag": "en_IN", "value": "ANC"}],
 				"item_dimensions": {"length": {"unit": "centimeters", "value": 10.0}},
 				"unit_count": {"value": 1, "type": {"language_tag": "en_IN", "value": "count"}},
+				"recommended_browse_nodes": "3732888211",
 			},
 		)
 		field_map = {m["fieldname"]: m for m in meta}
@@ -818,6 +830,44 @@ class TestAmazonOutbound(IntegrationTestCase):
 		self.assertEqual(field_map["bullet_point"]["placeholder"], "ANC")
 		self.assertEqual(field_map["item_dimensions"]["widget_type"], "dimensions")
 		self.assertEqual(field_map["unit_count"]["widget_type"], "unit_count")
+		self.assertEqual(field_map["recommended_browse_nodes"]["placeholder"], "e.g. 3732888211 (Browse Node ID)")
+
+		# 4. Large API enum + enumNames (>50 options) renders as Select with matched enum code
+		large_enums = [f"opt_{i}" for i in range(60)] + ["hardcover", "paperback"]
+		large_names = [f"Option {i}" for i in range(60)] + ["Hardcover", "Paperback"]
+		book_defn = {
+			"productType": "ABIS_BOOK",
+			"schemaLink": None,
+			"raw": {
+				"schema": {
+					"required": ["binding"],
+					"properties": {
+						"binding": {
+							"type": "array",
+							"items": {
+								"type": "object",
+								"properties": {
+									"value": {
+										"type": "string",
+										"examples": ["Hardcover"],
+										"enum": large_enums,
+										"enumNames": large_names,
+									}
+								},
+							},
+						}
+					},
+				}
+			},
+		}
+		with patch.object(outbound, "get_product_type_definition", return_value=book_defn):
+			book_tmpl = outbound.build_attributes_template("ABIS_BOOK")
+			self.assertEqual(book_tmpl["binding"], "hardcover")
+			book_meta = outbound.build_attributes_metadata("ABIS_BOOK", tmpl=book_tmpl)
+			binding_meta = {m["fieldname"]: m for m in book_meta}["binding"]
+			self.assertEqual(binding_meta["fieldtype"], "Select")
+			self.assertIsInstance(binding_meta["options"], list)
+			self.assertIn({"label": "Hardcover", "value": "hardcover"}, binding_meta["options"])
 
 	def test_seed_default_item_attributes_is_idempotent(self):
 		from amazon_connector.setup_fixtures import DEFAULT_ITEM_ATTRIBUTES, _seed_default_item_attributes
