@@ -45,7 +45,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y clang-18
           python3 -m pip install --upgrade pip
-          pip install "antigravity-code-indexer[gcp] @ git+https://github.com/DharshanOB/Ast_machine_code_codebase_idx.git"
+          pip install "astraea-code-indexer[gcp] @ git+https://github.com/DharshanOB/astraea.git"
 
       - name: Run 4-Layer PR Analysis & Gemini Review
         env:
