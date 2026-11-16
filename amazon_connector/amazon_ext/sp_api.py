@@ -279,6 +279,8 @@ class SPAPI:
 			if restricted_data_token
 			else self.get_headers()
 		)
+		if method.upper() == "DELETE" and "Content-Type" not in headers:
+			headers = {**headers, "Content-Type": "application/json; charset=utf-8"}
 
 		response = request(
 			method=method,
@@ -457,25 +459,26 @@ class Orders(SPAPI):
 		rdt_kwargs = {"restricted_data_token": restricted_data_token} if restricted_data_token else {}
 		return self.make_request(params=data, **rdt_kwargs)
 
-	def get_order(self, order_id: str, restricted_data_token: str | None = None) -> dict:
+	def _get_order_subresource(
+		self, order_id: str, suffix: str = "", restricted_data_token: str | None = None
+	) -> dict:
 		rdt_kwargs = {"restricted_data_token": restricted_data_token} if restricted_data_token else {}
 		return self.make_request(
-			append_to_base_uri=f"/{quote(str(order_id), safe='')}",
+			append_to_base_uri=f"/{quote(str(order_id), safe='')}{suffix}",
 			**rdt_kwargs,
 		)
 
+	def get_order(self, order_id: str, restricted_data_token: str | None = None) -> dict:
+		return self._get_order_subresource(order_id, restricted_data_token=restricted_data_token)
+
 	def get_order_buyer_info(self, order_id: str, restricted_data_token: str | None = None) -> dict:
-		rdt_kwargs = {"restricted_data_token": restricted_data_token} if restricted_data_token else {}
-		return self.make_request(
-			append_to_base_uri=f"/{quote(str(order_id), safe='')}/buyerInfo",
-			**rdt_kwargs,
+		return self._get_order_subresource(
+			order_id, suffix="/buyerInfo", restricted_data_token=restricted_data_token
 		)
 
 	def get_order_address(self, order_id: str, restricted_data_token: str | None = None) -> dict:
-		rdt_kwargs = {"restricted_data_token": restricted_data_token} if restricted_data_token else {}
-		return self.make_request(
-			append_to_base_uri=f"/{quote(str(order_id), safe='')}/address",
-			**rdt_kwargs,
+		return self._get_order_subresource(
+			order_id, suffix="/address", restricted_data_token=restricted_data_token
 		)
 
 	def get_order_items(self, order_id: str, next_token: str | None = None) -> dict:

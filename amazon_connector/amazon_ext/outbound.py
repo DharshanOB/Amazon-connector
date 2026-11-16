@@ -333,10 +333,11 @@ class AmazonOutboundSync:
 		requirements: str | None = None,
 	) -> dict:
 		"""Fetch and normalize ProductTypeDefinitions metadata for a product type."""
-		pt = (product_type or "PRODUCT").strip()
-		resolved_req = requirements or ("LISTING_OFFER_ONLY" if pt.upper() == "PRODUCT" else "LISTING")
+		pt = (product_type or "PRODUCT").strip().upper()
+		resolved_req = requirements or ("LISTING_OFFER_ONLY" if pt == "PRODUCT" else "LISTING")
 		mkt = self.get_marketplace_id(marketplace_id)
-		cache_key = (pt, mkt, resolved_req)
+		resolved_seller = self.get_seller_id(seller_id)
+		cache_key = (pt, mkt, resolved_req, resolved_seller)
 		if cache_key in self._ptd_cache:
 			return self._ptd_cache[cache_key]
 
@@ -344,7 +345,6 @@ class AmazonOutboundSync:
 			return {}
 
 		client = self.repository.get_product_type_definitions_instance()
-		resolved_seller = self.get_seller_id(seller_id)
 		raw = self._call_sp_api(
 			client.get_definitions_product_type,
 			product_type=pt,
@@ -354,24 +354,27 @@ class AmazonOutboundSync:
 		)
 		if isinstance(raw, dict) and "payload" in raw:
 			raw = raw.get("payload") or {}
+		if not isinstance(raw, dict):
+			raw = {}
 
-		schema_props = (raw or {}).get("schema") or {}
-		property_groups = (raw or {}).get("propertyGroups") or {}
+		schema_props = raw.get("schema") or {}
+		property_groups = raw.get("propertyGroups") or {}
 		required_attrs: list[str] = []
 		for group in property_groups.values() if isinstance(property_groups, dict) else []:
-			for pname in group.get("propertyNames") or []:
+			for pname in (group.get("propertyNames") or []) if isinstance(group, dict) else []:
 				if pname not in required_attrs:
 					required_attrs.append(pname)
 
 		definition = {
-			"productType": (raw or {}).get("productType") or pt,
-			"productTypeVersion": ((raw or {}).get("productTypeVersion") or {}).get("version"),
-			"requirements": (raw or {}).get("requirements") or requirements,
+			"productType": raw.get("productType") or pt,
+			"productTypeVersion": (raw.get("productTypeVersion") or {}).get("version"),
+			"requirements": raw.get("requirements") or resolved_req,
 			"propertyNames": required_attrs,
 			"schemaLink": (schema_props.get("link") or {}).get("resource"),
-			"raw": raw or {},
+			"raw": raw,
 		}
-		self._ptd_cache[cache_key] = definition
+		if raw:
+			self._ptd_cache[cache_key] = definition
 		return definition
 
 	def _resolve_product_type_schema(self, product_type: str) -> dict:
@@ -382,23 +385,33 @@ class AmazonOutboundSync:
 
 		try:
 			defn = self.get_product_type_definition(pt) or {}
-		except Exception:
+		except Exception as exc:
+			frappe.logger("amazon_connector").warning(
+				f"Failed to fetch ProductTypeDefinition for {pt}: {exc}"
+			)
 			defn = {}
 
 		schema_url = defn.get("schemaLink")
 		schema: dict = {}
 		if schema_url:
-			cache_key = f"amz_pt_schema::{pt}"
+			mkt = self.get_marketplace_id()
+			cache_key = f"amz_pt_schema::{mkt}::{pt}"
 			cached = frappe.cache.get_value(cache_key) if hasattr(frappe, "cache") else None
 			if isinstance(cached, dict) and cached:
 				return cached
 			try:
-				resp = requests.get(schema_url, timeout=15)
+				from amazon_connector.amazon_ext.repository import _validate_endpoint_url
+
+				safe_url = _validate_endpoint_url(schema_url)
+				resp = requests.get(safe_url, timeout=15)
 				if resp.status_code < 400:
 					schema = resp.json() or {}
 					if schema and hasattr(frappe, "cache"):
 						frappe.cache.set_value(cache_key, schema, expires_in_sec=3600)
-			except Exception:
+			except Exception as exc:
+				frappe.logger("amazon_connector").warning(
+					f"Failed to download product type schema for {pt} from {schema_url}: {exc}"
+				)
 				schema = {}
 
 		if not schema:
@@ -406,130 +419,25 @@ class AmazonOutboundSync:
 		return schema
 
 	def build_attributes_template(self, product_type: str) -> dict:
-		"""Generate a schema-compliant JSON attributes template for an Amazon product type."""
+		"""Generate a UI-ready JSON attributes template for an Amazon product type."""
 		pt = (product_type or "PRODUCT").strip().upper()
 		if pt == "PRODUCT":
 			return {}
 
 		schema = self._resolve_product_type_schema(pt)
-
 		props = schema.get("properties") or {}
 		req_set = set(schema.get("required") or [])
 		lang_tag = self.get_language_tag()
 
-		priority_fields = [
-			"item_type_name",
-			"model_name",
-			"model_number",
-			"color",
-			"author",
-			"binding",
-			"pages",
-			"publication_date",
-			"language",
-			"recommended_browse_nodes",
-			"product_tax_code",
-			"headphones_form_factor",
-			"connectivity_technology",
-			"included_components",
-			"bullet_point",
-			"batteries_required",
-			"number_of_items",
-			"unit_count",
-			"item_dimensions",
-			"base_product_mfg_warranty_period",
-			"warranty_provider_contact_information",
-			"steps_to_avail_mfg_warranty_description",
-			"base_product_mfg_warranty_tnc_description",
-		]
-
 		target_keys: list[str] = []
-		for k in priority_fields:
-			if k in props and k not in STANDARD_AUTO_ATTRS and k not in target_keys:
-				target_keys.append(k)
+		for key in (*_TEMPLATE_PRIORITY_FIELDS, *sorted(req_set)):
+			if key in props and key not in STANDARD_AUTO_ATTRS and key not in target_keys:
+				target_keys.append(key)
 
-		for k in sorted(req_set):
-			if k in props and k not in STANDARD_AUTO_ATTRS and k not in target_keys:
-				target_keys.append(k)
-
-		template: dict = {}
-		for key in target_keys:
-			prop = props.get(key) or {}
-			prop_type = prop.get("type")
-			items = prop.get("items") or {}
-			item_props = items.get("properties") or {}
-
-			if key == "product_tax_code":
-				template[key] = "A_GEN_NOTAX"
-				continue
-			if key == "batteries_required":
-				template[key] = False
-				continue
-			if key == "number_of_items":
-				template[key] = 1
-				continue
-			if key == "bullet_point":
-				template[key] = [
-					{"language_tag": lang_tag, "value": "Key feature 1"},
-					{"language_tag": lang_tag, "value": "Key feature 2"},
-				]
-				continue
-			if key == "item_dimensions":
-				template[key] = {
-					"length": {"unit": "centimeters", "value": 10.0},
-					"width": {"unit": "centimeters", "value": 10.0},
-					"height": {"unit": "centimeters", "value": 5.0},
-				}
-				continue
-			if key == "unit_count":
-				template[key] = {"value": 1, "type": {"language_tag": lang_tag, "value": "count"}}
-				continue
-			if key == "base_product_mfg_warranty_period":
-				template[key] = {"unit": "years", "value": 1}
-				continue
-			if key == "language" and "type" in item_props and "value" in item_props:
-				template[key] = {"type": "published", "value": "english"}
-				continue
-			if key == "pages":
-				template[key] = {"unit": "pages", "value": 100}
-				continue
-
-			if prop_type == "array" and items:
-				if "language_tag" in item_props and "value" in item_props:
-					val_prop = item_props.get("value") or {}
-					v_enums = val_prop.get("enum") or prop.get("enum") or []
-					ex = prop.get("examples") or val_prop.get("examples")
-					if v_enums:
-						val_ex = _match_enum_example(v_enums, ex[0] if isinstance(ex, list) and ex else None)
-					else:
-						val_ex = ex[0] if isinstance(ex, list) and ex else f"Enter {key.replace('_', ' ')}"
-					template[key] = {"language_tag": lang_tag, "value": val_ex}
-				elif "unit" in item_props and "value" in item_props:
-					unit_prop = item_props.get("unit") or {}
-					u_enums = unit_prop.get("enum") or []
-					unit_val = u_enums[0] if u_enums else "centimeters"
-					template[key] = {"unit": unit_val, "value": 1.0}
-				elif "value" in item_props:
-					val_prop = item_props.get("value") or {}
-					v_enums = val_prop.get("enum") or []
-					ex = prop.get("examples") or val_prop.get("examples")
-					if v_enums:
-						template[key] = _match_enum_example(v_enums, ex[0] if isinstance(ex, list) and ex else None)
-					else:
-						template[key] = ex[0] if isinstance(ex, list) and ex else ""
-				else:
-					template[key] = []
-			elif prop_type == "boolean":
-				template[key] = False
-			elif prop_type in ("integer", "number"):
-				template[key] = 1
-			elif "enum" in prop:
-				template[key] = prop["enum"][0]
-			else:
-				ex = prop.get("examples")
-				template[key] = ex[0] if isinstance(ex, list) and ex else ""
-
-		return template
+		return {
+			key: _build_template_property_value(key, props.get(key) or {}, lang_tag)
+			for key in target_keys
+		}
 
 	def build_attributes_metadata(self, product_type: str, tmpl: dict | None = None) -> list[dict]:
 		"""Generate structured metadata for dynamic Desk input fields."""
@@ -544,158 +452,10 @@ class AmazonOutboundSync:
 		props = schema.get("properties") or {}
 		req_set = set(schema.get("required") or [])
 
-		safe_default_keys = {
-			"product_tax_code",
-			"batteries_required",
-			"number_of_items",
-			"unit_count",
-			"language",
-			"base_product_mfg_warranty_period",
-		}
-		long_text_keys = {
-			"bullet_point",
-			"included_components",
-			"steps_to_avail_mfg_warranty_description",
-			"base_product_mfg_warranty_tnc_description",
-			"warranty_provider_contact_information",
-		}
-
-		fields_meta: list[dict] = []
-		for key, t_val in template.items():
-			prop = props.get(key) or {}
-			title = prop.get("title") or key.replace("_", " ").title()
-			prop_type = prop.get("type")
-			items = prop.get("items") or {}
-			item_props = items.get("properties") or {}
-
-			val_prop = item_props.get("value") if isinstance(item_props.get("value"), dict) else {}
-			val_format = val_prop.get("format") or prop.get("format")
-			desc = prop.get("description") or val_prop.get("description") or ""
-
-			enums, enum_names = _extract_schema_enums(prop, item_props, val_prop)
-
-			if not enums:
-				if key == "binding":
-					enums = ["paperback", "hardcover", "board_book", "spiral_bound", "mass_market", "audiobook"]
-					enum_names = ["Paperback", "Hardcover", "Board Book", "Spiral Bound", "Mass Market Paperback", "Audiobook"]
-				elif key in ("headphones_form_factor", "form_factor"):
-					enums = ["over_ear", "on_ear", "in_ear"]
-					enum_names = ["Over Ear", "On Ear", "In Ear"]
-				elif key == "connectivity_technology":
-					enums = ["Wireless", "Bluetooth", "Wired", "NFC", "USB"]
-					enum_names = None
-
-			unit = None
-			unit_options = None
-			if isinstance(t_val, dict) and "unit" in t_val:
-				unit = t_val["unit"]
-			elif "unit" in item_props:
-				u_enums = (item_props["unit"] or {}).get("enum") or []
-				if u_enums:
-					unit = u_enums[0]
-					unit_options = u_enums
-
-			if key == "item_dimensions" and not unit_options:
-				dim_len = ((item_props.get("length") or {}).get("properties") or {}).get("unit") or {}
-				unit_options = dim_len.get("enum") or ["centimeters", "millimeters", "inches", "meters"]
-
-			has_lang = False
-			if isinstance(t_val, dict) and "language_tag" in t_val:
-				has_lang = True
-			elif "language_tag" in item_props or "language_tag" in prop.get("properties", {}):
-				has_lang = True
-
-			widget_type = "standard"
-			if key == "item_dimensions":
-				widget_type = "dimensions"
-			elif key == "bullet_point":
-				widget_type = "bullet_list"
-			elif key == "unit_count":
-				widget_type = "unit_count"
-			elif key == "language" and isinstance(t_val, dict) and "type" in t_val:
-				widget_type = "language_obj"
-
-			is_scalar_wrapped = (
-				isinstance(t_val, dict)
-				and "value" in t_val
-				and set(t_val.keys()) <= {"value", "language_tag", "unit", "marketplace_id"}
-			)
-
-			if val_format == "date" or key in ("publication_date", "release_date", "first_available_date"):
-				ft = "Date"
-			elif val_format == "date-time":
-				ft = "Datetime"
-			elif prop_type == "boolean" or isinstance(t_val, bool) or val_prop.get("type") == "boolean":
-				ft = "Check"
-			elif enums and isinstance(enums, list) and 1 < len(enums) <= 250:
-				ft = "Select"
-			elif (
-				prop_type == "integer"
-				or val_prop.get("type") == "integer"
-				or (isinstance(t_val, int) and not isinstance(t_val, bool))
-				or (isinstance(t_val, dict) and isinstance(t_val.get("value"), int) and not isinstance(t_val.get("value"), bool))
-			):
-				ft = "Int"
-			elif (
-				prop_type == "number"
-				or val_prop.get("type") == "number"
-				or isinstance(t_val, float)
-				or (isinstance(t_val, dict) and isinstance(t_val.get("value"), float))
-			):
-				ft = "Float"
-			elif key in long_text_keys:
-				ft = "Small Text"
-			elif widget_type in ("dimensions", "language_obj"):
-				ft = "Data"
-			elif not is_scalar_wrapped and isinstance(t_val, (list, dict)):
-				ft = "Small Text"
-			else:
-				ft = "Data"
-
-			placeholder = ""
-			if widget_type == "bullet_list" and isinstance(t_val, list):
-				lines = [str(b.get("value", b) if isinstance(b, dict) else b) for b in t_val]
-				placeholder = "\n".join(line for line in lines if line)
-			elif widget_type == "dimensions":
-				placeholder = ""
-			elif isinstance(t_val, dict):
-				placeholder = str(t_val.get("value", ""))
-			elif isinstance(t_val, list):
-				placeholder = ", ".join(str(v.get("value", v) if isinstance(v, dict) else v) for v in t_val)
-			elif t_val is not None and not isinstance(t_val, bool):
-				placeholder = str(t_val)
-
-			if key == "recommended_browse_nodes":
-				node_ex = placeholder if placeholder.isdigit() else "3732888211"
-				placeholder = f"e.g. {node_ex} (Browse Node ID)"
-
-			options_val: str | list | None = None
-			if ft == "Select" and enums:
-				if enum_names and isinstance(enum_names, list) and len(enum_names) == len(enums):
-					options_val = [{"label": "", "value": ""}] + [
-						{"label": str(lbl), "value": str(val)} for val, lbl in zip(enums, enum_names)
-					]
-				else:
-					options_val = "\n" + "\n".join(str(e) for e in enums)
-
-			is_req = 1 if (key in req_set or key in ("author", "binding", "model_name", "item_type_name")) else 0
-
-			fields_meta.append({
-				"fieldname": key,
-				"label": title,
-				"fieldtype": ft,
-				"widget_type": widget_type,
-				"reqd": is_req,
-				"options": options_val,
-				"unit": unit,
-				"unit_options": unit_options,
-				"has_lang": has_lang,
-				"is_safe_default": key in safe_default_keys,
-				"placeholder": placeholder,
-				"description": desc,
-				"default": t_val,
-			})
-
+		fields_meta = [
+			_build_single_field_metadata(key, t_val, props.get(key) or {}, req_set)
+			for key, t_val in template.items()
+		]
 		fields_meta.sort(key=lambda x: (0 if x["reqd"] else 1, x["label"]))
 		return fields_meta
 
@@ -753,36 +513,39 @@ class AmazonOutboundSync:
 		if available_stock_uom <= 0:
 			return 0.0
 
-		item = frappe.get_cached_doc("Item", item_code) if frappe.db.exists("Item", item_code) else None
+		item = _get_cached_item(item_code)
 		conv_factor = self.get_uom_conversion_factor(item, target_uom=target_uom) if item else 1.0
-		return float(int(max(0.0, available_stock_uom / conv_factor)))
+		return float(int(max(0.0, available_stock_uom / (conv_factor if flt(conv_factor) > 0 else 1.0))))
 
 	def get_item_price(
 		self, item_code: str, price_list: str | None = None, uom: str | None = None
 	) -> float:
 		"""Resolve active positive selling price respecting selling=1, UOM, and valid date window."""
 		pl = price_list or self.amz_setting.get("price_list")
-		item = frappe.get_cached_doc("Item", item_code) if frappe.db.exists("Item", item_code) else None
+		item = _get_cached_item(item_code)
 		stock_uom = getattr(item, "stock_uom", None) if item else None
 		target_uom = uom or (getattr(item, "sales_uom", None) if item else None) or stock_uom
 		current_date = getdate(today())
 
 		if pl:
 			expected_currency = frappe.db.get_value("Price List", pl, "currency") or self.get_currency()
+			price_fields = [
+				"price_list_rate",
+				"uom",
+				"valid_from",
+				"valid_upto",
+				"modified",
+				"customer",
+				"batch_no",
+				"packing_unit",
+				"currency",
+			]
+			if frappe.db.has_column("Item Price", "min_qty"):
+				price_fields.append("min_qty")
 			price_rows = frappe.get_all(
 				"Item Price",
 				filters={"item_code": item_code, "price_list": pl, "selling": 1},
-				fields=[
-					"price_list_rate",
-					"uom",
-					"valid_from",
-					"valid_upto",
-					"modified",
-					"customer",
-					"batch_no",
-					"packing_unit",
-					"currency",
-				],
+				fields=price_fields,
 				order_by="modified desc",
 			)
 			valid_rows = [
@@ -795,7 +558,9 @@ class AmazonOutboundSync:
 				rate = flt(chosen.get("price_list_rate"))
 				row_uom = chosen.get("uom") or stock_uom
 				if item and target_uom and row_uom and row_uom != target_uom:
-					rate = rate * self.get_uom_conversion_factor(item, target_uom=target_uom) / self.get_uom_conversion_factor(item, target_uom=row_uom)
+					row_factor = flt(self.get_uom_conversion_factor(item, target_uom=row_uom))
+					if row_factor > 0:
+						rate = rate * flt(self.get_uom_conversion_factor(item, target_uom=target_uom)) / row_factor
 				return flt(rate)
 
 		if item and flt(item.standard_rate) > 0:
@@ -1567,36 +1332,36 @@ def update_stock_and_price(
 	)
 
 
-@frappe.whitelist()
-def fetch_amazon_listing(item_code: str, amz_setting_name: str | None = None) -> dict:
-	frappe.has_permission("Item", "read", throw=True)
+def _get_authorized_outbound_sync(
+	item_code: str | None = None,
+	item_ptype: str = "read",
+	amz_setting_name: str | None = None,
+	setting_ptype: str = "read",
+) -> AmazonOutboundSync:
+	frappe.has_permission("Item", item_ptype, throw=True)
 	if item_code and frappe.db.exists("Item", item_code):
-		frappe.has_permission("Item", "read", doc=item_code, throw=True)
-	amz_setting_name = _resolve_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "read", doc=amz_setting_name, throw=True)
+		frappe.has_permission("Item", item_ptype, doc=item_code, throw=True)
+	resolved_setting = _resolve_setting_name(amz_setting_name)
+	frappe.has_permission("Amazon SP API Settings", setting_ptype, doc=resolved_setting, throw=True)
 	from amazon_connector.amazon_ext.repository import (
 		CustomAmazonRepository as AmazonRepository,
 	)
 
-	repo = AmazonRepository(amz_setting_name)
-	return AmazonOutboundSync(repo).get_listings_item(item_code)
+	return AmazonOutboundSync(AmazonRepository(resolved_setting))
+
+
+@frappe.whitelist()
+def fetch_amazon_listing(item_code: str, amz_setting_name: str | None = None) -> dict:
+	sync = _get_authorized_outbound_sync(item_code=item_code, item_ptype="read", amz_setting_name=amz_setting_name, setting_ptype="read")
+	return sync.get_listings_item(item_code)
 
 
 @frappe.whitelist()
 def delete_amazon_listing(
 	item_code: str, amz_setting_name: str | None = None, remove_mapping: int = 1
 ) -> dict:
-	frappe.has_permission("Item", "delete", throw=True)
-	if item_code and frappe.db.exists("Item", item_code):
-		frappe.has_permission("Item", "delete", doc=item_code, throw=True)
-	amz_setting_name = _resolve_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "write", doc=amz_setting_name, throw=True)
-	from amazon_connector.amazon_ext.repository import (
-		CustomAmazonRepository as AmazonRepository,
-	)
-
-	repo = AmazonRepository(amz_setting_name)
-	return AmazonOutboundSync(repo).delete_listing(
+	sync = _get_authorized_outbound_sync(item_code=item_code, item_ptype="delete", amz_setting_name=amz_setting_name, setting_ptype="write")
+	return sync.delete_listing(
 		item_code=item_code, remove_mapping=bool(frappe.utils.cint(remove_mapping))
 	)
 
@@ -1622,30 +1387,15 @@ def delete_amazon_listing_by_sku(
 def get_amazon_product_type_definition(
 	product_type: str, amz_setting_name: str | None = None
 ) -> dict:
-	frappe.has_permission("Item", "read", throw=True)
-	amz_setting_name = _resolve_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "read", doc=amz_setting_name, throw=True)
-	from amazon_connector.amazon_ext.repository import (
-		CustomAmazonRepository as AmazonRepository,
-	)
-
-	repo = AmazonRepository(amz_setting_name)
-	return AmazonOutboundSync(repo).get_product_type_definition(product_type)
+	sync = _get_authorized_outbound_sync(item_ptype="read", amz_setting_name=amz_setting_name, setting_ptype="read")
+	return sync.get_product_type_definition(product_type)
 
 
 @frappe.whitelist()
 def get_category_attributes_template(
 	product_type: str, amz_setting_name: str | None = None
 ) -> dict:
-	frappe.has_permission("Item", "read", throw=True)
-	amz_setting_name = _resolve_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "read", doc=amz_setting_name, throw=True)
-	from amazon_connector.amazon_ext.repository import (
-		CustomAmazonRepository as AmazonRepository,
-	)
-
-	repo = AmazonRepository(amz_setting_name)
-	sync = AmazonOutboundSync(repo)
+	sync = _get_authorized_outbound_sync(item_ptype="read", amz_setting_name=amz_setting_name, setting_ptype="read")
 	tmpl = sync.build_attributes_template(product_type)
 	fields_meta = sync.build_attributes_metadata(product_type, tmpl=tmpl)
 	return {
@@ -2146,3 +1896,247 @@ def _match_enum_example(enums: list, example_val) -> object:
 		if norm_cand == norm_target:
 			return candidate
 	return enums[0]
+
+
+_TEMPLATE_PRIORITY_FIELDS = (
+	"item_type_name",
+	"model_name",
+	"model_number",
+	"color",
+	"author",
+	"binding",
+	"pages",
+	"publication_date",
+	"language",
+	"recommended_browse_nodes",
+	"product_tax_code",
+	"headphones_form_factor",
+	"connectivity_technology",
+	"included_components",
+	"bullet_point",
+	"batteries_required",
+	"number_of_items",
+	"unit_count",
+	"item_dimensions",
+	"base_product_mfg_warranty_period",
+	"warranty_provider_contact_information",
+	"steps_to_avail_mfg_warranty_description",
+	"base_product_mfg_warranty_tnc_description",
+)
+
+_SAFE_DEFAULT_KEYS = frozenset({
+	"product_tax_code",
+	"batteries_required",
+	"number_of_items",
+	"unit_count",
+	"language",
+	"base_product_mfg_warranty_period",
+})
+
+_LONG_TEXT_KEYS = frozenset({
+	"bullet_point",
+	"included_components",
+	"steps_to_avail_mfg_warranty_description",
+	"base_product_mfg_warranty_tnc_description",
+	"warranty_provider_contact_information",
+})
+
+_FALLBACK_KEY_ENUMS: dict[str, tuple[list[str], list[str] | None]] = {
+	"binding": (
+		["paperback", "hardcover", "board_book", "spiral_bound", "mass_market", "audiobook"],
+		["Paperback", "Hardcover", "Board Book", "Spiral Bound", "Mass Market Paperback", "Audiobook"],
+	),
+	"headphones_form_factor": (["over_ear", "on_ear", "in_ear"], ["Over Ear", "On Ear", "In Ear"]),
+	"form_factor": (["over_ear", "on_ear", "in_ear"], ["Over Ear", "On Ear", "In Ear"]),
+	"connectivity_technology": (["Wireless", "Bluetooth", "Wired", "NFC", "USB"], None),
+}
+
+_STATIC_TEMPLATE_VALUES: dict[str, object] = {
+	"product_tax_code": "A_GEN_NOTAX",
+	"batteries_required": False,
+	"number_of_items": 1,
+	"item_dimensions": {
+		"length": {"unit": "centimeters", "value": 10.0},
+		"width": {"unit": "centimeters", "value": 10.0},
+		"height": {"unit": "centimeters", "value": 5.0},
+	},
+	"base_product_mfg_warranty_period": {"unit": "years", "value": 1},
+	"pages": {"unit": "pages", "value": 100},
+}
+
+
+def _get_cached_item(item_code: str):
+	"""Return cached Item doc or None without firing a redundant db.exists query."""
+	if not item_code:
+		return None
+	try:
+		return frappe.get_cached_doc("Item", item_code)
+	except frappe.DoesNotExistError:
+		return None
+
+
+def _build_template_property_value(key: str, prop: dict, lang_tag: str):
+	if key in _STATIC_TEMPLATE_VALUES:
+		val = _STATIC_TEMPLATE_VALUES[key]
+		return {k: dict(v) if isinstance(v, dict) else v for k, v in val.items()} if isinstance(val, dict) else val
+	if key == "bullet_point":
+		return [{"language_tag": lang_tag, "value": "Key feature 1"}, {"language_tag": lang_tag, "value": "Key feature 2"}]
+	if key == "unit_count":
+		return {"value": 1, "type": {"language_tag": lang_tag, "value": "count"}}
+
+	prop_type = prop.get("type")
+	items = prop.get("items") or {}
+	item_props = items.get("properties") or {}
+	if key == "language" and "type" in item_props and "value" in item_props:
+		return {"type": "published", "value": "english"}
+
+	if prop_type == "array" and items:
+		if "language_tag" in item_props and "value" in item_props:
+			val_prop = item_props.get("value") or {}
+			v_enums = val_prop.get("enum") or prop.get("enum") or []
+			ex = prop.get("examples") or val_prop.get("examples")
+			first_ex = ex[0] if isinstance(ex, list) and ex else None
+			val_ex = _match_enum_example(v_enums, first_ex) if v_enums else (first_ex or f"Enter {key.replace('_', ' ')}")
+			return {"language_tag": lang_tag, "value": val_ex}
+		if "unit" in item_props and "value" in item_props:
+			u_enums = (item_props.get("unit") or {}).get("enum") or []
+			return {"unit": u_enums[0] if u_enums else "centimeters", "value": 1.0}
+		if "value" in item_props:
+			val_prop = item_props.get("value") or {}
+			v_enums = val_prop.get("enum") or []
+			ex = prop.get("examples") or val_prop.get("examples")
+			first_ex = ex[0] if isinstance(ex, list) and ex else None
+			return _match_enum_example(v_enums, first_ex) if v_enums else (first_ex or "")
+		return []
+
+	if prop_type == "boolean":
+		return False
+	if prop_type in ("integer", "number"):
+		return 1
+	if "enum" in prop:
+		return prop["enum"][0]
+	ex = prop.get("examples")
+	return ex[0] if isinstance(ex, list) and ex else ""
+
+
+def _extract_field_unit_options(key: str, t_val, item_props: dict) -> tuple[str | None, list | None]:
+	unit = t_val["unit"] if isinstance(t_val, dict) and "unit" in t_val else None
+	unit_options = None
+	if unit is None and "unit" in item_props:
+		u_enums = (item_props["unit"] or {}).get("enum") or []
+		if u_enums:
+			unit, unit_options = u_enums[0], u_enums
+	if key == "item_dimensions" and not unit_options:
+		dim_len = ((item_props.get("length") or {}).get("properties") or {}).get("unit") or {}
+		unit_options = dim_len.get("enum") or ["centimeters", "millimeters", "inches", "meters"]
+	return unit, unit_options
+
+
+def _infer_metadata_fieldtype(
+	key: str, prop_type: str | None, val_prop: dict, t_val, enums: list | None, widget_type: str
+) -> str:
+	val_format = val_prop.get("format")
+	if val_format == "date" or key in ("publication_date", "release_date", "first_available_date"):
+		return "Date"
+	if val_format == "date-time":
+		return "Datetime"
+	if prop_type == "boolean" or isinstance(t_val, bool) or val_prop.get("type") == "boolean":
+		return "Check"
+	if enums and isinstance(enums, list) and 1 < len(enums) <= 250:
+		return "Select"
+
+	inner_val = t_val.get("value") if isinstance(t_val, dict) else None
+	if (
+		prop_type == "integer"
+		or val_prop.get("type") == "integer"
+		or (isinstance(t_val, int) and not isinstance(t_val, bool))
+		or (isinstance(inner_val, int) and not isinstance(inner_val, bool))
+	):
+		return "Int"
+	if (
+		prop_type == "number"
+		or val_prop.get("type") == "number"
+		or isinstance(t_val, float)
+		or isinstance(inner_val, float)
+	):
+		return "Float"
+	if key in _LONG_TEXT_KEYS:
+		return "Small Text"
+	if widget_type in ("dimensions", "language_obj"):
+		return "Data"
+
+	is_scalar_wrapped = (
+		isinstance(t_val, dict)
+		and "value" in t_val
+		and set(t_val.keys()) <= {"value", "language_tag", "unit", "marketplace_id"}
+	)
+	return "Small Text" if (not is_scalar_wrapped and isinstance(t_val, (list, dict))) else "Data"
+
+
+def _build_field_placeholder(key: str, widget_type: str, t_val) -> str:
+	placeholder = ""
+	if widget_type == "bullet_list" and isinstance(t_val, list):
+		placeholder = "\n".join(str(b.get("value", b) if isinstance(b, dict) else b) for b in t_val if b)
+	elif widget_type == "dimensions":
+		placeholder = ""
+	elif isinstance(t_val, dict):
+		placeholder = str(t_val.get("value", ""))
+	elif isinstance(t_val, list):
+		placeholder = ", ".join(str(v.get("value", v) if isinstance(v, dict) else v) for v in t_val)
+	elif t_val is not None and not isinstance(t_val, bool):
+		placeholder = str(t_val)
+
+	if key == "recommended_browse_nodes":
+		node_ex = placeholder if placeholder.isdigit() else "3732888211"
+		return f"e.g. {node_ex} (Browse Node ID)"
+	return placeholder
+
+
+def _build_single_field_metadata(key: str, t_val, prop: dict, req_set: set[str]) -> dict:
+	item_props = (prop.get("items") or {}).get("properties") or {}
+	val_prop = item_props.get("value") if isinstance(item_props.get("value"), dict) else {}
+	if prop.get("format") and not val_prop.get("format"):
+		val_prop = {**val_prop, "format": prop.get("format")}
+
+	enums, enum_names = _extract_schema_enums(prop, item_props, val_prop)
+	if not enums and key in _FALLBACK_KEY_ENUMS:
+		enums, enum_names = _FALLBACK_KEY_ENUMS[key]
+
+	unit, unit_options = _extract_field_unit_options(key, t_val, item_props)
+	has_lang = bool(
+		(isinstance(t_val, dict) and "language_tag" in t_val)
+		or "language_tag" in item_props
+		or "language_tag" in prop.get("properties", {})
+	)
+
+	widget_type = "standard"
+	if key in ("item_dimensions", "bullet_point", "unit_count"):
+		widget_type = {"item_dimensions": "dimensions", "bullet_point": "bullet_list", "unit_count": "unit_count"}[key]
+	elif key == "language" and isinstance(t_val, dict) and "type" in t_val:
+		widget_type = "language_obj"
+
+	ft = _infer_metadata_fieldtype(key, prop.get("type"), val_prop, t_val, enums, widget_type)
+	options_val: str | list | None = None
+	if ft == "Select" and enums:
+		if enum_names and isinstance(enum_names, list) and len(enum_names) == len(enums):
+			options_val = [{"label": "", "value": ""}] + [
+				{"label": str(lbl), "value": str(val)} for val, lbl in zip(enums, enum_names)
+			]
+		else:
+			options_val = "\n" + "\n".join(str(e) for e in enums)
+
+	return {
+		"fieldname": key,
+		"label": prop.get("title") or key.replace("_", " ").title(),
+		"fieldtype": ft,
+		"widget_type": widget_type,
+		"reqd": 1 if (key in req_set or key in ("author", "binding", "model_name", "item_type_name")) else 0,
+		"options": options_val,
+		"unit": unit,
+		"unit_options": unit_options,
+		"has_lang": has_lang,
+		"is_safe_default": key in _SAFE_DEFAULT_KEYS,
+		"placeholder": _build_field_placeholder(key, widget_type, t_val),
+		"description": prop.get("description") or val_prop.get("description") or "",
+		"default": t_val,
+	}

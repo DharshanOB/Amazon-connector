@@ -536,97 +536,150 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 
 		return final_order_items
 
-	def create_sales_order(self, order) -> str | None:
-		def create_customer(order_doc) -> str:
-			buyer_info = order_doc.get("BuyerInfo") or {}
-			if buyer_info.get("BuyerEmail"):
-				order_customer_name = buyer_info.get("BuyerEmail")
-			else:
-				order_customer_name = f"Buyer - {order_doc.get('AmazonOrderId')}"
+	def _ensure_order_customer(self, order_doc: dict) -> str:
+		buyer_info = order_doc.get("BuyerInfo") or {}
+		order_customer_name = buyer_info.get("BuyerEmail") or f"Buyer - {order_doc.get('AmazonOrderId')}"
+		contact_first_name = buyer_info.get("BuyerName") or order_customer_name
 
-			contact_first_name = buyer_info.get("BuyerName") or order_customer_name
-			existing_customer_name = frappe.db.get_value(
-				"Customer", filters={"name": order_customer_name}, fieldname="name"
-			) or frappe.db.get_value(
-				"Customer", filters={"customer_name": order_customer_name}, fieldname="name"
-			)
+		existing_customer_name = frappe.db.get_value(
+			"Customer", filters={"name": order_customer_name}, fieldname="name"
+		) or frappe.db.get_value(
+			"Customer", filters={"customer_name": order_customer_name}, fieldname="name"
+		)
 
-			if existing_customer_name:
-				filters = [
-					["Dynamic Link", "link_doctype", "=", "Customer"],
-					["Dynamic Link", "link_name", "=", existing_customer_name],
-					["Dynamic Link", "parenttype", "=", "Contact"],
-				]
-				if not frappe.get_list("Contact", filters):
-					new_contact = frappe.new_doc("Contact")
-					new_contact.first_name = contact_first_name
-					new_contact.append(
-						"links",
-						{"link_doctype": "Customer", "link_name": existing_customer_name},
-					)
-					new_contact.insert()
-				return existing_customer_name
+		if existing_customer_name:
+			filters = [
+				["Dynamic Link", "link_doctype", "=", "Customer"],
+				["Dynamic Link", "link_name", "=", existing_customer_name],
+				["Dynamic Link", "parenttype", "=", "Contact"],
+			]
+			if not frappe.get_all("Contact", filters=filters, limit=1):
+				self._create_customer_contact(existing_customer_name, contact_first_name)
+			return existing_customer_name
 
-			new_customer = frappe.new_doc("Customer")
-			new_customer.customer_name = order_customer_name
-			new_customer.customer_group = self.amz_setting.customer_group
-			new_customer.territory = self.amz_setting.territory
-			new_customer.customer_type = self.amz_setting.customer_type
-			new_customer.save()
+		new_customer = frappe.new_doc("Customer")
+		new_customer.customer_name = order_customer_name
+		new_customer.customer_group = self.amz_setting.customer_group
+		new_customer.territory = self.amz_setting.territory
+		new_customer.customer_type = self.amz_setting.customer_type
+		new_customer.insert(ignore_permissions=True)
 
-			new_contact = frappe.new_doc("Contact")
-			new_contact.first_name = contact_first_name
-			new_contact.append("links", {"link_doctype": "Customer", "link_name": new_customer.name})
-			new_contact.insert()
+		self._create_customer_contact(new_customer.name, contact_first_name)
+		return new_customer.name
 
-			return new_customer.name
+	@staticmethod
+	def _create_customer_contact(customer_name: str, first_name: str) -> None:
+		new_contact = frappe.new_doc("Contact")
+		new_contact.first_name = first_name
+		new_contact.append("links", {"link_doctype": "Customer", "link_name": customer_name})
+		new_contact.insert(ignore_permissions=True)
 
-		def _resolve_country_name(country_code: str | None) -> str | None:
-			code = (country_code or "").strip()
-			if code:
-				by_code = frappe.db.get_value("Country", {"code": code.lower()}, "name")
-				if by_code:
-					return by_code
-				by_name = frappe.db.get_value("Country", {"name": code}, "name")
-				if by_name:
-					return by_name
-			return frappe.db.get_value("Company", self.amz_setting.company, "country")
+	def _resolve_country_name(self, country_code: str | None) -> str | None:
+		code = (country_code or "").strip()
+		if code:
+			by_code = frappe.db.get_value("Country", {"code": code.lower()}, "name")
+			if by_code:
+				return by_code
+			by_name = frappe.db.get_value("Country", {"name": code}, "name")
+			if by_name:
+				return by_name
+		return frappe.db.get_value("Company", self.amz_setting.company, "country")
 
-		def create_address(order_doc, customer_name) -> str | None:
-			shipping_address = order_doc.get("ShippingAddress")
-			if not shipping_address:
-				return None
+	def _ensure_order_address(self, order_doc: dict, customer_name: str) -> str | None:
+		shipping_address = order_doc.get("ShippingAddress")
+		if not shipping_address:
+			return None
 
-			make_address = frappe.new_doc("Address")
-			make_address.address_title = shipping_address.get("Name") or customer_name
-			make_address.address_line1 = shipping_address.get("AddressLine1") or "Not Provided"
-			make_address.city = shipping_address.get("City") or "Not Provided"
-			make_address.state = get_state_name_from_pincode(
-				shipping_address.get("CountryCode") or "",
-				shipping_address.get("PostalCode") or "",
-				(shipping_address.get("StateOrRegion") or "").title(),
-			)
-			make_address.pincode = shipping_address.get("PostalCode")
-			make_address.country = _resolve_country_name(shipping_address.get("CountryCode"))
+		address_line1 = shipping_address.get("AddressLine1") or "Not Provided"
+		city = shipping_address.get("City") or "Not Provided"
+		state = get_state_name_from_pincode(
+			shipping_address.get("CountryCode") or "",
+			shipping_address.get("PostalCode") or "",
+			(shipping_address.get("StateOrRegion") or "").title(),
+		)
+		pincode = shipping_address.get("PostalCode")
+		country = self._resolve_country_name(shipping_address.get("CountryCode"))
 
+		if address_line1 != "Not Provided":
 			filters = [
 				["Dynamic Link", "link_doctype", "=", "Customer"],
 				["Dynamic Link", "link_name", "=", customer_name],
 				["Dynamic Link", "parenttype", "=", "Address"],
 			]
-			for address in frappe.get_list("Address", filters):
-				address_doc = frappe.get_doc("Address", address["name"])
+			existing_addresses = frappe.get_all(
+				"Address",
+				filters=filters,
+				fields=["name", "address_line1", "city", "pincode", "country"],
+			)
+			for addr in existing_addresses:
 				if (
-					address_doc.address_line1 == make_address.address_line1
-					and address_doc.pincode == make_address.pincode
+					addr.get("address_line1") == address_line1
+					and (addr.get("city") or "") == (city or "")
+					and (addr.get("pincode") or "") == (pincode or "")
+					and (addr.get("country") or "") == (country or "")
 				):
-					return address["name"]
+					return addr["name"]
 
-			make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
-			make_address.address_type = "Shipping"
-			make_address.insert(ignore_permissions=True)
-			return make_address.name
+		make_address = frappe.new_doc("Address")
+		make_address.address_title = shipping_address.get("Name") or customer_name
+		make_address.address_line1 = address_line1
+		make_address.city = city
+		make_address.state = state
+		make_address.pincode = pincode
+		make_address.country = country
+		make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
+		make_address.address_type = "Shipping"
+		make_address.insert(ignore_permissions=True)
+		return make_address.name
 
+	def _handle_existing_sales_order(
+		self,
+		so_name: str,
+		order_status: str | None,
+		fulfillment_channel: str | None,
+		is_prime: int,
+	) -> str | None:
+		existing_so_meta = frappe.db.get_value(
+			"Sales Order",
+			so_name,
+			["docstatus", "grand_total", "per_delivered", "per_billed", "amazon_order_status", "customer"],
+			as_dict=True,
+		)
+		# Replace 0-value Pending placeholder once order pricing becomes available.
+		if (
+			existing_so_meta
+			and existing_so_meta.docstatus != 2
+			and flt(existing_so_meta.grand_total) == 0
+			and flt(existing_so_meta.per_delivered) == 0
+			and flt(existing_so_meta.per_billed) == 0
+			and existing_so_meta.amazon_order_status in ("Pending", "PendingAvailability", None, "")
+			and order_status not in ("Pending", "PendingAvailability", "Canceled")
+		):
+			old_so = frappe.get_doc("Sales Order", so_name)
+			if old_so.docstatus == 1:
+				old_so.flags.from_amazon_sync = True
+				old_so.flags.ignore_permissions = True
+				old_so.cancel()
+			frappe.delete_doc("Sales Order", so_name, force=1, ignore_permissions=True)
+			return None
+
+		so_updates = {}
+		if frappe.db.has_column("Sales Order", "amazon_order_status"):
+			so_updates["amazon_order_status"] = order_status
+		if frappe.db.has_column("Sales Order", "fulfillment_channel"):
+			so_updates["fulfillment_channel"] = fulfillment_channel
+		if frappe.db.has_column("Sales Order", "is_prime"):
+			so_updates["is_prime"] = is_prime
+		if so_updates:
+			frappe.db.set_value("Sales Order", so_name, so_updates, update_modified=False)
+		if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
+			"Pending",
+			"PendingAvailability",
+		):
+			create_sales_invoice_from_sales_order(self, so_name)
+		return so_name
+
+	def create_sales_order(self, order) -> str | None:
 		order_id = order.get("AmazonOrderId")
 		order_status = order.get("OrderStatus")
 		fulfillment_channel = order.get("FulfillmentChannel")
@@ -639,47 +692,9 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 			return so_name
 
 		if so_name:
-			existing_so_meta = frappe.db.get_value(
-				"Sales Order",
-				so_name,
-				["docstatus", "grand_total", "per_delivered", "per_billed", "amazon_order_status", "customer"],
-				as_dict=True,
-			)
-			# If a Sales Order was imported while Pending with 0.00 pricing and is now confirmed (Unshipped/Shipped),
-			# replace the 0-value placeholder order before invoicing/shipping.
-			if (
-				existing_so_meta
-				and existing_so_meta.docstatus != 2
-				and flt(existing_so_meta.grand_total) == 0
-				and flt(existing_so_meta.per_delivered) == 0
-				and flt(existing_so_meta.per_billed) == 0
-				and existing_so_meta.amazon_order_status in ("Pending", "PendingAvailability", None, "")
-				and order_status not in ("Pending", "PendingAvailability", "Canceled")
-			):
-				old_so = frappe.get_doc("Sales Order", so_name)
-				if old_so.docstatus == 1:
-					old_so.flags.from_amazon_sync = True
-					old_so.flags.ignore_permissions = True
-					old_so.cancel()
-				frappe.delete_doc("Sales Order", so_name, force=1, ignore_permissions=True)
-				so_name = None
-
-		if so_name:
-			so_updates = {}
-			if frappe.db.has_column("Sales Order", "amazon_order_status"):
-				so_updates["amazon_order_status"] = order_status
-			if frappe.db.has_column("Sales Order", "fulfillment_channel"):
-				so_updates["fulfillment_channel"] = fulfillment_channel
-			if frappe.db.has_column("Sales Order", "is_prime"):
-				so_updates["is_prime"] = is_prime
-			if so_updates:
-				frappe.db.set_value("Sales Order", so_name, so_updates, update_modified=False)
-			if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
-				"Pending",
-				"PendingAvailability",
-			):
-				create_sales_invoice_from_sales_order(self, so_name)
-			return so_name
+			handled = self._handle_existing_sales_order(so_name, order_status, fulfillment_channel, is_prime)
+			if handled:
+				return handled
 
 		target_warehouse = (
 			(self.amz_setting.get("fba_warehouse") or self.amz_setting.warehouse)
@@ -691,8 +706,8 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		if not items:
 			return None
 
-		customer_name = create_customer(order)
-		address_name = create_address(order, customer_name)
+		customer_name = self._ensure_order_customer(order)
+		address_name = self._ensure_order_address(order, customer_name)
 
 		raw_purchase_date = order.get("PurchaseDate")
 		transaction_date = (

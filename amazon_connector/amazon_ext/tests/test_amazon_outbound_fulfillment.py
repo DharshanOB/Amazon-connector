@@ -968,6 +968,118 @@ class TestAmazonOutbound(IntegrationTestCase):
 
 		frappe.delete_doc("Item Group", ig.name, force=1)
 
+	def test_ptd_cache_seller_normalization_and_schema_ssrf_guard(self):
+		repo = _make_mock_repo()
+		ptd = MagicMock()
+		ptd.get_definitions_product_type.side_effect = [
+			{},
+			{"productType": "ABIS_BOOK", "propertyGroups": {}},
+			{"productType": "ABIS_BOOK", "propertyGroups": {}},
+		]
+		repo.get_product_type_definitions_instance.return_value = ptd
+
+		outbound = amazon_outbound.AmazonOutboundSync(repo)
+		# Empty raw payload is NOT cached
+		first = outbound.get_product_type_definition("abis_book")
+		self.assertEqual(first["productType"], "ABIS_BOOK")
+		self.assertEqual(first["requirements"], "LISTING")
+
+		# Different seller_id does NOT collide with cache
+		outbound.get_product_type_definition("abis_book", seller_id="SELLER-A")
+		outbound.get_product_type_definition("abis_book", seller_id="SELLER-B")
+		self.assertEqual(ptd.get_definitions_product_type.call_count, 3)
+
+		# SSRF schemaLink (e.g. 169.254.169.254) is rejected without calling requests.get
+		bad_defn = {
+			"productType": "HEADPHONES",
+			"schemaLink": "http://169.254.169.254/latest/meta-data/",
+			"raw": {"schema": {"properties": {"model_name": {"type": "array"}}}},
+		}
+		with (
+			patch.object(outbound, "get_product_type_definition", return_value=bad_defn),
+			patch("amazon_connector.amazon_ext.outbound.requests.get") as mock_get,
+		):
+			schema = outbound._resolve_product_type_schema("HEADPHONES")
+			mock_get.assert_not_called()
+			self.assertIn("model_name", schema.get("properties", {}))
+
+	def test_sales_order_address_dedup_and_cancel_batching(self):
+		from amazon_connector.amazon_ext.lifecycle import cancel_erpnext_order_from_amazon
+		from amazon_connector.amazon_ext.repository import CustomAmazonRepository
+
+		repo = CustomAmazonRepository.__new__(CustomAmazonRepository)
+		repo.amz_setting = frappe._dict(
+			name="AMZ-ADDR-TEST",
+			company=self.company,
+			customer_group=frappe.get_all("Customer Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			territory=frappe.get_all("Territory", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			customer_type="Individual",
+		)
+
+		order_a = {
+			"AmazonOrderId": _uid("ORD-A"),
+			"BuyerInfo": {"BuyerEmail": f"{_uid('buyer')}@example.com", "BuyerName": "Buyer A"},
+			"ShippingAddress": {
+				"Name": "Buyer A",
+				"AddressLine1": "12 MG Road",
+				"City": "Bengaluru",
+				"StateOrRegion": "KA",
+				"PostalCode": "560001",
+				"CountryCode": "IN",
+			},
+		}
+		cust = repo._ensure_order_customer(order_a)
+		addr1 = repo._ensure_order_address(order_a, cust)
+		addr2 = repo._ensure_order_address(order_a, cust)
+		self.assertEqual(addr1, addr2)
+
+		# "Not Provided" placeholders never match existing real or blank addresses
+		blank_order = {
+			"AmazonOrderId": _uid("ORD-BLANK"),
+			"ShippingAddress": {"Name": "Buyer A", "City": "Bengaluru", "PostalCode": "560001", "CountryCode": "IN"},
+		}
+		addr_blank_1 = repo._ensure_order_address(blank_order, cust)
+		addr_blank_2 = repo._ensure_order_address(blank_order, cust)
+		self.assertNotEqual(addr_blank_1, addr1)
+		self.assertNotEqual(addr_blank_1, addr_blank_2)
+
+		# cancel_erpnext_order_from_amazon skips redundant db_set when already canceled
+		fake_so = MagicMock()
+		fake_so.name = "SO-ALREADY-CANCELED"
+		fake_so.docstatus = 2
+		fake_so.get.side_effect = lambda k, d=None: {"amazon_order_status": "Canceled", "amazon_canceled": 1}.get(k, d)
+		with (
+			patch("amazon_connector.amazon_ext.lifecycle.frappe.get_doc", return_value=fake_so),
+			patch("amazon_connector.amazon_ext.lifecycle.frappe.db.has_column", return_value=True),
+		):
+			cancel_erpnext_order_from_amazon(repo, {"AmazonOrderId": "111-111"}, "SO-ALREADY-CANCELED")
+			fake_so.db_set.assert_not_called()
+
+	def test_spapi_delete_includes_json_content_type(self):
+		from amazon_connector.amazon_ext.sp_api import ListingsItems
+
+		client = ListingsItems(
+			iam_arn="arn:aws:iam::123:role/test",
+			client_id="C",
+			client_secret="S",
+			refresh_token="R",
+			aws_access_key="AK",
+			aws_secret_key="SK",
+			country_code="IN",
+		)
+		fake_resp = MagicMock(status_code=200, content=b'{"status":"ACCEPTED"}', json=lambda: {"status": "ACCEPTED"})
+		with (
+			patch.object(client, "get_access_token", return_value="tok"),
+			patch.object(client, "get_auth", return_value=MagicMock()),
+			patch("amazon_connector.amazon_ext.sp_api.request", return_value=fake_resp) as mock_req,
+		):
+			res = client.delete_listings_item("SELLER-1", "SKU-1")
+			self.assertEqual(res["status"], "ACCEPTED")
+			self.assertEqual(
+				mock_req.call_args.kwargs["headers"].get("Content-Type"),
+				"application/json; charset=utf-8",
+			)
+
 
 class TestAmazonFulfillment(IntegrationTestCase):
 	def setUp(self):

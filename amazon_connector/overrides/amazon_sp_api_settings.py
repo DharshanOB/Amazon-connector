@@ -282,37 +282,29 @@ def _resolve_amz_setting_name(amz_setting_name: str | None = None, company: str 
 	return amz_setting_name
 
 
-@frappe.whitelist()
-def sync_outbound_item(item_code: str, amz_setting_name: str | None = None) -> dict:
+def _sync_outbound_for_item(item_code: str, amz_setting_name: str | None, repo_method: str) -> dict:
 	frappe.has_permission("Item", "write", throw=True)
 	if item_code and frappe.db.exists("Item", item_code):
 		frappe.has_permission("Item", "write", doc=item_code, throw=True)
 	resolved_setting = _resolve_amz_setting_name(amz_setting_name)
 	frappe.has_permission("Amazon SP API Settings", "write", doc=resolved_setting, throw=True)
 	repo = CustomAmazonRepository(resolved_setting)
-	return repo.sync_outbound_listing(item_code)
+	return getattr(repo, repo_method)(item_code)
+
+
+@frappe.whitelist()
+def sync_outbound_item(item_code: str, amz_setting_name: str | None = None) -> dict:
+	return _sync_outbound_for_item(item_code, amz_setting_name, "sync_outbound_listing")
 
 
 @frappe.whitelist()
 def sync_outbound_item_stock(item_code: str, amz_setting_name: str | None = None) -> dict:
-	frappe.has_permission("Item", "write", throw=True)
-	if item_code and frappe.db.exists("Item", item_code):
-		frappe.has_permission("Item", "write", doc=item_code, throw=True)
-	resolved_setting = _resolve_amz_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "write", doc=resolved_setting, throw=True)
-	repo = CustomAmazonRepository(resolved_setting)
-	return repo.sync_outbound_stock(item_code)
+	return _sync_outbound_for_item(item_code, amz_setting_name, "sync_outbound_stock")
 
 
 @frappe.whitelist()
 def sync_outbound_item_price(item_code: str, amz_setting_name: str | None = None) -> dict:
-	frappe.has_permission("Item", "write", throw=True)
-	if item_code and frappe.db.exists("Item", item_code):
-		frappe.has_permission("Item", "write", doc=item_code, throw=True)
-	resolved_setting = _resolve_amz_setting_name(amz_setting_name)
-	frappe.has_permission("Amazon SP API Settings", "write", doc=resolved_setting, throw=True)
-	repo = CustomAmazonRepository(resolved_setting)
-	return repo.sync_outbound_price(item_code)
+	return _sync_outbound_for_item(item_code, amz_setting_name, "sync_outbound_price")
 
 
 @frappe.whitelist()

@@ -532,32 +532,26 @@ def ensure_item_group(item_group_name: str | None, parent_item_group: str) -> st
 	return new_item_group.item_group_name
 
 
-def ensure_brand(brand_name: str | None) -> str | None:
-	if not brand_name:
+def _ensure_master_record(doctype: str, fieldname: str, value: str | None) -> str | None:
+	if not value:
 		return None
 
-	existing = frappe.db.get_value("Brand", filters={"brand": brand_name})
+	existing = frappe.db.get_value(doctype, filters={fieldname: value})
 	if existing:
 		return existing
 
-	brand = frappe.new_doc("Brand")
-	brand.brand = brand_name
-	brand.insert(ignore_permissions=True)
-	return brand.brand
+	doc = frappe.new_doc(doctype)
+	setattr(doc, fieldname, value)
+	doc.insert(ignore_permissions=True)
+	return getattr(doc, fieldname)
+
+
+def ensure_brand(brand_name: str | None) -> str | None:
+	return _ensure_master_record("Brand", "brand", brand_name)
 
 
 def ensure_manufacturer(manufacturer_name: str | None) -> str | None:
-	if not manufacturer_name:
-		return None
-
-	existing = frappe.db.get_value("Manufacturer", filters={"short_name": manufacturer_name})
-	if existing:
-		return existing
-
-	manufacturer = frappe.new_doc("Manufacturer")
-	manufacturer.short_name = manufacturer_name
-	manufacturer.insert(ignore_permissions=True)
-	return manufacturer.short_name
+	return _ensure_master_record("Manufacturer", "short_name", manufacturer_name)
 
 
 def _resolve_target_warehouse(warehouse: str) -> str | None:

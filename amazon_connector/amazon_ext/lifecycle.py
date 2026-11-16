@@ -207,9 +207,9 @@ def cancel_erpnext_order_from_amazon(repo, order: dict, sales_order_name: str) -
 	so = frappe.get_doc("Sales Order", sales_order_name)
 	order_id = order.get("AmazonOrderId") or so.get("amazon_order_id")
 
-	if frappe.db.has_column("Sales Order", "amazon_order_status"):
+	if frappe.db.has_column("Sales Order", "amazon_order_status") and so.get("amazon_order_status") != "Canceled":
 		so.db_set("amazon_order_status", "Canceled", update_modified=False)
-	if frappe.db.has_column("Sales Order", "amazon_canceled"):
+	if frappe.db.has_column("Sales Order", "amazon_canceled") and not cint(so.get("amazon_canceled")):
 		so.db_set("amazon_canceled", 1, update_modified=False)
 
 	if so.docstatus == 2:
@@ -221,8 +221,13 @@ def cancel_erpnext_order_from_amazon(repo, order: dict, sales_order_name: str) -
 		pluck="parent",
 		distinct=True,
 	)
-	for dn_name in linked_draft_dns:
-		if frappe.db.get_value("Delivery Note", dn_name, "imported_from_amazon"):
+	if linked_draft_dns:
+		amazon_draft_dns = frappe.get_all(
+			"Delivery Note",
+			filters={"name": ["in", linked_draft_dns], "imported_from_amazon": 1},
+			pluck="name",
+		)
+		for dn_name in amazon_draft_dns:
 			frappe.delete_doc("Delivery Note", dn_name, ignore_permissions=True)
 
 	submitted_dn = frappe.db.get_value(
