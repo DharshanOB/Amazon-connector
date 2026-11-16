@@ -22,17 +22,17 @@ def create_log(
 	make_new=False,
 	commit=True,
 ):
-	make_new = make_new or not bool(frappe.flags.request_id)
+	is_new_log = make_new or not bool(frappe.flags.request_id)
 	in_savepoint = bool(getattr(frappe.flags, "in_amazon_sync_savepoint", False))
 
 	if rollback and not in_savepoint and not getattr(frappe.db, "_disable_transaction_control", 0):
 		frappe.db.rollback()
 
-	if make_new:
-		log = frappe.get_doc({"doctype": "Ecommerce Integration Log", "integration": cstr(module_def)})
-		log.insert(ignore_permissions=True)
-	else:
+	if not is_new_log and frappe.db.exists("Ecommerce Integration Log", frappe.flags.request_id):
 		log = frappe.get_doc("Ecommerce Integration Log", frappe.flags.request_id)
+	else:
+		is_new_log = True
+		log = frappe.get_doc({"doctype": "Ecommerce Integration Log", "integration": cstr(module_def)})
 
 	if response_data and not isinstance(response_data, str):
 		response_data = json.dumps(response_data, sort_keys=True, indent=4, default=str)
@@ -49,7 +49,10 @@ def create_log(
 	log.request_data = request_data or log.request_data
 	log.traceback = frappe.get_traceback()
 	log.status = status
-	log.save(ignore_permissions=True)
+	if is_new_log:
+		log.insert(ignore_permissions=True)
+	else:
+		log.save(ignore_permissions=True)
 
 	if (
 		commit
@@ -63,11 +66,12 @@ def create_log(
 
 
 def _get_message(exception):
-	if hasattr(exception, "message"):
-		return strip_html(exception.message)
-	if hasattr(exception, "__str__"):
-		return strip_html(cstr(exception))
-	return "Something went wrong while syncing"
+	if exception is None:
+		return "Something went wrong while syncing"
+	if hasattr(exception, "message") and exception.message:
+		return strip_html(cstr(exception.message))
+	msg = strip_html(cstr(exception))
+	return msg or "Something went wrong while syncing"
 
 
 @frappe.whitelist()

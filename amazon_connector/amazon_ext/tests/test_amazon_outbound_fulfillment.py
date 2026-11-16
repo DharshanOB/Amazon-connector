@@ -1080,6 +1080,100 @@ class TestAmazonOutbound(IntegrationTestCase):
 				"application/json; charset=utf-8",
 			)
 
+	def test_spapi_sts_cache_non_mutating_remove_empty_and_error_guards(self):
+		from datetime import datetime, timedelta, timezone
+		from amazon_connector.amazon_ext.sp_api import SPAPI, SPAPIError, Util
+
+		# Util.remove_empty should not mutate caller payload in-place
+		original_payload = {"a": 1, "b": None, "c": "", "d": False, "e": 0}
+		cleaned = Util.remove_empty(original_payload)
+		self.assertEqual(cleaned, {"a": 1, "d": False, "e": 0})
+		self.assertIn("b", original_payload)
+		self.assertIn("c", original_payload)
+
+		# STS credentials cached across calls until near Expiration
+		api = SPAPI(
+			iam_arn="arn:aws:iam::123:role/test",
+			client_id="C",
+			client_secret="S",
+			refresh_token="R",
+			aws_access_key="AK",
+			aws_secret_key="SK",
+			country_code="IN",
+		)
+		sts_mock = MagicMock()
+		sts_mock.assume_role.return_value = {
+			"Credentials": {
+				"AccessKeyId": "ASIA1",
+				"SecretAccessKey": "SEC1",
+				"SessionToken": "TOK1",
+				"Expiration": datetime.now(timezone.utc) + timedelta(minutes=30),
+			}
+		}
+		with patch("amazon_connector.amazon_ext.sp_api.boto3.client", return_value=sts_mock):
+			api.get_auth()
+			api.get_auth()
+		self.assertEqual(sts_mock.assume_role.call_count, 1)
+
+		# Error list with string elements should not raise AttributeError; non-JSON 200 raises SPAPIError
+		err_resp = MagicMock(status_code=400, content=b'{"errors":["PlainStringErr"]}', text='{"errors":["PlainStringErr"]}', json=lambda: {"errors": ["PlainStringErr"]})
+		html_resp = MagicMock(status_code=200, content=b"<html>oops</html>", json=MagicMock(side_effect=ValueError("no json")))
+		with (
+			patch.object(api, "get_access_token", return_value="tok"),
+			patch.object(api, "get_auth", return_value=MagicMock()),
+		):
+			with patch("amazon_connector.amazon_ext.sp_api.request", return_value=err_resp):
+				with self.assertRaises(SPAPIError):
+					api.make_request("GET", "/test")
+			with patch("amazon_connector.amazon_ext.sp_api.request", return_value=html_resp):
+				with self.assertRaises(SPAPIError):
+					api.make_request("GET", "/test")
+
+	def test_log_fallback_fx_guard_and_pending_so_atomicity(self):
+		from amazon_connector.amazon_ext.log_patch import _get_message, create_log
+		from amazon_connector.amazon_ext.repository import CustomAmazonRepository
+
+		self.assertEqual(_get_message(None), "Something went wrong while syncing")
+		prev_req_id = getattr(frappe.flags, "request_id", None)
+		frappe.flags.request_id = "NONEXISTENT-REQ-999"
+		try:
+			log_doc = create_log(module_def="amazon", make_new=False, exception=None, commit=False)
+			self.assertEqual(log_doc.message, "Something went wrong while syncing")
+			frappe.delete_doc("Ecommerce Integration Log", log_doc.name, force=1, ignore_permissions=True)
+		finally:
+			frappe.flags.request_id = prev_req_id
+
+		repo = object.__new__(CustomAmazonRepository)
+		repo.amz_setting = frappe._dict(company=self.company, taxes_charges=0, warehouse=self.warehouse)
+
+		# Foreign currency without exchange rate throws instead of forcing conversion_rate=1.0
+		with (
+			patch("amazon_connector.amazon_ext.repository.frappe.db.get_value", return_value="INR"),
+			patch("amazon_connector.amazon_ext.repository.frappe.db.exists", return_value=True),
+			patch("erpnext.setup.utils.get_exchange_rate", return_value=0.0),
+		):
+			with self.assertRaises(frappe.ValidationError):
+				repo._resolve_so_currency_and_rate({"OrderTotal": {"CurrencyCode": "USD"}}, [], "2026-11-16")
+
+		# Pending placeholder SO must NOT be canceled/deleted if get_order_items returns empty
+		pending_meta = frappe._dict(
+			docstatus=1,
+			grand_total=0,
+			per_delivered=0,
+			per_billed=0,
+			amazon_order_status="Pending",
+			customer="Cust",
+		)
+		with (
+			patch("amazon_connector.amazon_ext.repository.frappe.db.get_value", side_effect=["SO-PEND-1", pending_meta]),
+			patch.object(repo, "get_raw_order_items", return_value=[]),
+			patch.object(repo, "get_order_items", return_value=[]),
+			patch.object(repo, "_delete_pending_so_placeholder") as mock_del,
+		):
+			res = repo.create_sales_order({"AmazonOrderId": "AMZ-PEND-1", "OrderStatus": "Unshipped"})
+			self.assertIsNone(res)
+			mock_del.assert_not_called()
+
 
 class TestAmazonFulfillment(IntegrationTestCase):
 	def setUp(self):

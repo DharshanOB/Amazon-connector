@@ -210,6 +210,7 @@ class SPAPI:
 		)
 		if self.custom_endpoint:
 			self.endpoint = self.custom_endpoint
+		self._sts_cache: tuple[tuple, dict] | None = None
 
 	def get_access_token(self) -> str:
 		data = {
@@ -225,12 +226,37 @@ class SPAPI:
 			return result.get("access_token")
 		raise SPAPIError(error=result.get("error"), error_description=result.get("error_description"))
 
+	def _get_cached_sts_credentials(self) -> dict | None:
+		if not self._sts_cache:
+			return None
+		cache_key, credentials = self._sts_cache
+		expected_key = (self.iam_arn, self.aws_access_key, self.region)
+		if cache_key != expected_key:
+			return None
+		exp = credentials.get("Expiration")
+		if not isinstance(exp, datetime.datetime):
+			return None
+		now = datetime.datetime.now(exp.tzinfo) if exp.tzinfo else datetime.datetime.utcnow()
+		if (exp - now).total_seconds() <= 60:
+			return None
+		return credentials
+
 	def get_auth(self) -> AWSSigV4:
 		if self.custom_endpoint:
 			return AWSSigV4(
 				service="execute-api",
 				aws_access_key_id=self.aws_access_key or "mock-access-key",
 				aws_secret_access_key=self.aws_secret_key or "mock-secret-key",
+				region=self.region,
+			)
+
+		cached_creds = self._get_cached_sts_credentials()
+		if cached_creds:
+			return AWSSigV4(
+				service="execute-api",
+				aws_access_key_id=cached_creds["AccessKeyId"],
+				aws_secret_access_key=cached_creds["SecretAccessKey"],
+				aws_session_token=cached_creds["SessionToken"],
 				region=self.region,
 			)
 
@@ -243,6 +269,8 @@ class SPAPI:
 			)
 			response = client.assume_role(RoleArn=self.iam_arn, RoleSessionName="SellingPartnerAPI")
 			credentials = response["Credentials"]
+			if isinstance(credentials.get("Expiration"), datetime.datetime):
+				self._sts_cache = ((self.iam_arn, self.aws_access_key, self.region), credentials)
 			return AWSSigV4(
 				service="execute-api",
 				aws_access_key_id=credentials["AccessKeyId"],
@@ -251,7 +279,7 @@ class SPAPI:
 				region=self.region,
 			)
 		except Exception as e:
-			raise SPAPIError(error="invalid_aws_credentials", error_description=e)
+			raise SPAPIError(error="invalid_aws_credentials", error_description=str(e))
 
 	def get_headers(self, restricted_data_token: str | None = None) -> dict:
 		return {"x-amz-access-token": restricted_data_token or self.get_access_token()}
@@ -273,7 +301,7 @@ class SPAPI:
 		if isinstance(json_data, dict):
 			json_data = Util.remove_empty(json_data)
 
-		url = self.endpoint + self.BASE_URI + append_to_base_uri
+		url = f"{self.endpoint.rstrip('/')}{self.BASE_URI}{append_to_base_uri}"
 		headers = (
 			self.get_headers(restricted_data_token=restricted_data_token)
 			if restricted_data_token
@@ -299,16 +327,23 @@ class SPAPI:
 			try:
 				result = response.json()
 			except ValueError:
+				if response.status_code < 400:
+					raise SPAPIError(
+						error=str(response.status_code),
+						error_description="Invalid JSON response returned by Amazon SP-API",
+					)
 				result = {}
 
 		if response.status_code >= 400:
 			errors = result.get("errors") if isinstance(result, dict) else None
 			if errors and isinstance(errors, list):
 				first_error = errors[0]
-				raise SPAPIError(
-					error=first_error.get("code", str(response.status_code)),
-					error_description=first_error.get("details") or first_error.get("message", response.text),
-				)
+				if isinstance(first_error, dict):
+					raise SPAPIError(
+						error=first_error.get("code", str(response.status_code)),
+						error_description=first_error.get("details") or first_error.get("message", response.text),
+					)
+				raise SPAPIError(error=str(response.status_code), error_description=str(first_error))
 			raise SPAPIError(error=str(response.status_code), error_description=response.text)
 
 		return result
@@ -785,14 +820,16 @@ class Util:
 
 	@staticmethod
 	def remove_empty(data_dict):
-		"""Remove keys whose values are None or empty containers/strings, preserving False and 0."""
-		for key in list(data_dict):
-			val = data_dict[key]
+		"""Return a copy omitting None and empty containers/strings while preserving False and 0."""
+		if not isinstance(data_dict, dict):
+			return data_dict
+		cleaned = {}
+		for key, val in data_dict.items():
 			is_empty = val is None or (
 				not isinstance(val, bool)
 				and isinstance(val, str | list | tuple | set | dict)
 				and len(val) == 0
 			)
-			if is_empty:
-				del data_dict[key]
-		return data_dict
+			if not is_empty:
+				cleaned[key] = val
+		return cleaned

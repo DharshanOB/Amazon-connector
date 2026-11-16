@@ -632,21 +632,30 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		make_address.insert(ignore_permissions=True)
 		return make_address.name
 
-	def _handle_existing_sales_order(
-		self,
-		so_name: str,
-		order_status: str | None,
-		fulfillment_channel: str | None,
-		is_prime: int,
-	) -> str | None:
-		existing_so_meta = frappe.db.get_value(
-			"Sales Order",
-			so_name,
-			["docstatus", "grand_total", "per_delivered", "per_billed", "amazon_order_status", "customer"],
-			as_dict=True,
-		)
-		# Replace 0-value Pending placeholder once order pricing becomes available.
-		if (
+	def _so_has_column(self, fieldname: str) -> bool:
+		cache = getattr(self, "_so_columns_cache", None)
+		if cache is None:
+			cache = {}
+			self._so_columns_cache = cache
+		if fieldname not in cache:
+			cache[fieldname] = bool(frappe.db.has_column("Sales Order", fieldname))
+		return cache[fieldname]
+
+	@staticmethod
+	def _parse_order_date(raw_value: str | None, fallback: str) -> str:
+		if not raw_value:
+			return fallback
+		try:
+			return dateutil.parser.parse(str(raw_value)).strftime("%Y-%m-%d")
+		except (ValueError, TypeError, OverflowError):
+			frappe.logger("amazon_connector").warning(
+				f"Could not parse Amazon order date {raw_value!r}; falling back to {fallback}."
+			)
+			return fallback
+
+	@staticmethod
+	def _is_pending_so_placeholder(existing_so_meta: dict | None, order_status: str | None) -> bool:
+		return bool(
 			existing_so_meta
 			and existing_so_meta.docstatus != 2
 			and flt(existing_so_meta.grand_total) == 0
@@ -654,21 +663,30 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 			and flt(existing_so_meta.per_billed) == 0
 			and existing_so_meta.amazon_order_status in ("Pending", "PendingAvailability", None, "")
 			and order_status not in ("Pending", "PendingAvailability", "Canceled")
-		):
-			old_so = frappe.get_doc("Sales Order", so_name)
-			if old_so.docstatus == 1:
-				old_so.flags.from_amazon_sync = True
-				old_so.flags.ignore_permissions = True
-				old_so.cancel()
-			frappe.delete_doc("Sales Order", so_name, force=1, ignore_permissions=True)
-			return None
+		)
 
+	@staticmethod
+	def _delete_pending_so_placeholder(so_name: str) -> None:
+		old_so = frappe.get_doc("Sales Order", so_name)
+		if old_so.docstatus == 1:
+			old_so.flags.from_amazon_sync = True
+			old_so.flags.ignore_permissions = True
+			old_so.cancel()
+		frappe.delete_doc("Sales Order", so_name, force=1, ignore_permissions=True)
+
+	def _update_existing_sales_order(
+		self,
+		so_name: str,
+		order_status: str | None,
+		fulfillment_channel: str | None,
+		is_prime: int,
+	) -> str:
 		so_updates = {}
-		if frappe.db.has_column("Sales Order", "amazon_order_status"):
+		if self._so_has_column("amazon_order_status"):
 			so_updates["amazon_order_status"] = order_status
-		if frappe.db.has_column("Sales Order", "fulfillment_channel"):
+		if self._so_has_column("fulfillment_channel"):
 			so_updates["fulfillment_channel"] = fulfillment_channel
-		if frappe.db.has_column("Sales Order", "is_prime"):
+		if self._so_has_column("is_prime"):
 			so_updates["is_prime"] = is_prime
 		if so_updates:
 			frappe.db.set_value("Sales Order", so_name, so_updates, update_modified=False)
@@ -678,6 +696,36 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		):
 			create_sales_invoice_from_sales_order(self, so_name)
 		return so_name
+
+	def _resolve_so_currency_and_rate(
+		self, order: dict, raw_items: list[dict], transaction_date: str
+	) -> tuple[str | None, float | None]:
+		order_currency = (order.get("OrderTotal") or {}).get("CurrencyCode")
+		if not order_currency and raw_items:
+			order_currency = ((raw_items[0].get("ItemPrice") or {}).get("CurrencyCode") or "").strip()
+		company_currency = frappe.db.get_value("Company", self.amz_setting.company, "default_currency")
+		if not (order_currency and company_currency and order_currency != company_currency):
+			return None, None
+		if not frappe.db.exists("Currency", order_currency):
+			return None, None
+
+		ex_rate = 0.0
+		try:
+			from erpnext.setup.utils import get_exchange_rate
+
+			ex_rate = flt(get_exchange_rate(order_currency, company_currency, transaction_date))
+		except Exception as exc:
+			frappe.logger("amazon_connector").warning(
+				f"Exchange rate lookup failed for {order_currency} -> {company_currency} on {transaction_date}: {exc}"
+			)
+
+		if ex_rate <= 0:
+			frappe.throw(
+				_("Missing valid exchange rate for {0} to {1} on {2}.").format(
+					order_currency, company_currency, transaction_date
+				)
+			)
+		return order_currency, ex_rate
 
 	def create_sales_order(self, order) -> str | None:
 		order_id = order.get("AmazonOrderId")
@@ -691,10 +739,18 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 				cancel_erpnext_order_from_amazon(self, order, so_name)
 			return so_name
 
+		replace_pending_so = False
 		if so_name:
-			handled = self._handle_existing_sales_order(so_name, order_status, fulfillment_channel, is_prime)
-			if handled:
-				return handled
+			existing_so_meta = frappe.db.get_value(
+				"Sales Order",
+				so_name,
+				["docstatus", "grand_total", "per_delivered", "per_billed", "amazon_order_status", "customer"],
+				as_dict=True,
+			)
+			if self._is_pending_so_placeholder(existing_so_meta, order_status):
+				replace_pending_so = True
+			else:
+				return self._update_existing_sales_order(so_name, order_status, fulfillment_channel, is_prime)
 
 		target_warehouse = (
 			(self.amz_setting.get("fba_warehouse") or self.amz_setting.warehouse)
@@ -706,33 +762,90 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		if not items:
 			return None
 
-		customer_name = self._ensure_order_customer(order)
-		address_name = self._ensure_order_address(order, customer_name)
-
-		raw_purchase_date = order.get("PurchaseDate")
-		transaction_date = (
-			dateutil.parser.parse(raw_purchase_date).strftime("%Y-%m-%d")
-			if raw_purchase_date
-			else today()
-		)
-		raw_ship_date = order.get("LatestShipDate") or order.get("EarliestShipDate") or raw_purchase_date
-		delivery_date = (
-			dateutil.parser.parse(raw_ship_date).strftime("%Y-%m-%d") if raw_ship_date else transaction_date
-		)
+		transaction_date = self._parse_order_date(order.get("PurchaseDate"), today())
+		raw_ship_date = order.get("LatestShipDate") or order.get("EarliestShipDate") or order.get("PurchaseDate")
+		delivery_date = self._parse_order_date(raw_ship_date, transaction_date)
 		if getdate(delivery_date) < getdate(transaction_date):
 			delivery_date = transaction_date
 
+		order_currency, conversion_rate = self._resolve_so_currency_and_rate(order, raw_items, transaction_date)
+		charges = (
+			self.get_charges_and_fees(order_id, raw_items=raw_items).get("charges", [])
+			if self.amz_setting.taxes_charges
+			else []
+		)
+		customer_name = self._ensure_order_customer(order)
+		address_name = self._ensure_order_address(order, customer_name)
+
+		so = self._build_sales_order_doc(
+			order_id=order_id,
+			order=order,
+			order_status=order_status,
+			fulfillment_channel=fulfillment_channel,
+			is_prime=is_prime,
+			customer_name=customer_name,
+			address_name=address_name,
+			delivery_date=delivery_date,
+			transaction_date=transaction_date,
+			target_warehouse=target_warehouse,
+			order_currency=order_currency,
+			conversion_rate=conversion_rate,
+			items=items,
+			charges=charges,
+		)
+
+		frappe.db.savepoint("amazon_so_create")
+		try:
+			if replace_pending_so and so_name:
+				self._delete_pending_so_placeholder(so_name)
+			so.insert(ignore_permissions=True)
+			so.submit()
+		except frappe.DuplicateEntryError:
+			frappe.db.rollback(save_point="amazon_so_create")
+			existing_name = frappe.db.get_value("Sales Order", {"amazon_order_id": order_id}, "name")
+			if existing_name:
+				return existing_name
+			raise
+		except Exception:
+			frappe.db.rollback(save_point="amazon_so_create")
+			raise
+
+		if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
+			"Pending",
+			"PendingAvailability",
+		):
+			create_sales_invoice_from_sales_order(self, so.name)
+
+		return so.name
+
+	def _build_sales_order_doc(
+		self,
+		order_id: str,
+		order: dict,
+		order_status: str | None,
+		fulfillment_channel: str | None,
+		is_prime: int,
+		customer_name: str,
+		address_name: str | None,
+		delivery_date: str,
+		transaction_date: str,
+		target_warehouse: str | None,
+		order_currency: str | None,
+		conversion_rate: float | None,
+		items: list[dict],
+		charges: list[dict],
+	):
 		so = frappe.new_doc("Sales Order")
 		so.amazon_order_id = order_id
-		if frappe.db.has_column("Sales Order", "marketplace_id"):
+		if self._so_has_column("marketplace_id"):
 			so.marketplace_id = order.get("MarketplaceId") or get_marketplace_id_for_setting(self.amz_setting)
-		if frappe.db.has_column("Sales Order", "amazon_order_status"):
+		if self._so_has_column("amazon_order_status"):
 			so.amazon_order_status = order_status
-		if frappe.db.has_column("Sales Order", "fulfillment_channel"):
+		if self._so_has_column("fulfillment_channel"):
 			so.fulfillment_channel = fulfillment_channel
-		if frappe.db.has_column("Sales Order", "is_prime"):
+		if self._so_has_column("is_prime"):
 			so.is_prime = is_prime
-		if frappe.db.has_column("Sales Order", "amazon_canceled"):
+		if self._so_has_column("amazon_canceled"):
 			so.amazon_canceled = 0
 		so.customer = customer_name
 		if address_name:
@@ -742,40 +855,14 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 		so.company = self.amz_setting.company
 		if target_warehouse and hasattr(so, "set_warehouse"):
 			so.set_warehouse = target_warehouse
-
-		order_currency = (order.get("OrderTotal") or {}).get("CurrencyCode")
-		if not order_currency and raw_items:
-			order_currency = ((raw_items[0].get("ItemPrice") or {}).get("CurrencyCode") or "").strip()
-		company_currency = frappe.db.get_value("Company", self.amz_setting.company, "default_currency")
-		if order_currency and company_currency and order_currency != company_currency:
-			if frappe.db.exists("Currency", order_currency):
-				so.currency = order_currency
-				try:
-					from erpnext.setup.utils import get_exchange_rate
-
-					ex_rate = flt(get_exchange_rate(order_currency, company_currency, transaction_date))
-				except Exception:
-					ex_rate = 0.0
-				so.conversion_rate = ex_rate if ex_rate > 0 else 1.0
-
+		if order_currency and conversion_rate:
+			so.currency = order_currency
+			so.conversion_rate = conversion_rate
 		for item in items:
 			so.append("items", item)
-
-		if self.amz_setting.taxes_charges:
-			charges_and_fees = self.get_charges_and_fees(order_id, raw_items=raw_items)
-			for charge in charges_and_fees.get("charges", []):
-				so.append("taxes", charge)
-
-		so.insert(ignore_permissions=True)
-		so.submit()
-
-		if cint(self.amz_setting.get("sync_sales_invoice")) and order_status not in (
-			"Pending",
-			"PendingAvailability",
-		):
-			create_sales_invoice_from_sales_order(self, so.name)
-
-		return so.name
+		for charge in charges:
+			so.append("taxes", charge)
+		return so
 
 	def _iter_orders(
 		self,
