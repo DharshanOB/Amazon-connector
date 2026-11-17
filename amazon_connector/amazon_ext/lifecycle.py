@@ -1,10 +1,14 @@
 # Copyright (c) 2026, Frappe and contributors
 # For license information, please see license.txt
 
+from datetime import date, datetime, timezone
+import re
+from zoneinfo import ZoneInfo
+
 import dateutil
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, now, strip_html, today
+from frappe.utils import cint, flt, get_system_timezone, getdate, now, strip_html, today
 
 from amazon_connector.amazon_ext.log_patch import create_log
 
@@ -272,13 +276,38 @@ def handle_sales_order_cancel(doc, method=None):
 		doc.db_set("amazon_canceled", 1, update_modified=False)
 
 
-def _to_iso_param(value) -> str | None:
+def format_sp_api_utc_datetime(value) -> str | None:
+	"""Convert a Frappe local datetime, date, or ISO string to UTC ISO 8601 (ending in Z)."""
 	if not value:
 		return None
-	if isinstance(value, str) and "T" in value:
-		return value
-	parsed = dateutil.parser.parse(str(value))
-	return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+	if isinstance(value, date) and not isinstance(value, datetime):
+		return f"{value.strftime('%Y-%m-%d')}T00:00:00Z"
+
+	if isinstance(value, str):
+		stripped = value.strip()
+		if not stripped:
+			return None
+		if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stripped):
+			return f"{stripped}T00:00:00Z"
+		parsed = dateutil.parser.parse(stripped)
+	elif isinstance(value, datetime):
+		parsed = value
+	else:
+		parsed = dateutil.parser.parse(str(value))
+
+	if parsed.tzinfo is None:
+		try:
+			site_tz = ZoneInfo(get_system_timezone() or "UTC")
+		except Exception:
+			site_tz = timezone.utc
+		parsed = parsed.replace(tzinfo=site_tz)
+
+	return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _to_iso_param(value) -> str | None:
+	return format_sp_api_utc_datetime(value)
 
 
 def _iter_financial_events(repo, posted_after=None, posted_before=None):

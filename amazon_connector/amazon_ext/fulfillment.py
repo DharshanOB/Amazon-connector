@@ -12,8 +12,9 @@ import dateutil.parser
 import frappe
 from erpnext.selling.doctype.sales_order.sales_order import make_delivery_note
 from frappe import _
-from frappe.utils import cint, flt, get_datetime, getdate, nowdate, now_datetime
+from frappe.utils import cint, flt, get_datetime, getdate, nowdate
 
+from amazon_connector.amazon_ext.lifecycle import format_sp_api_utc_datetime
 from amazon_connector.amazon_ext.listings import get_amazon_module_name
 from amazon_connector.amazon_ext.outbound import (
 	AmazonOutboundSync,
@@ -111,16 +112,8 @@ def map_carrier(carrier_name: str | None) -> tuple[str, str]:
 
 def format_iso_datetime(dt=None) -> str:
 	"""Format a datetime/date/str or current timestamp as UTC ISO 8601 ending in Z."""
-	if dt is None:
-		parsed = now_datetime()
-	elif isinstance(dt, datetime):
-		parsed = dt
-	else:
-		parsed = get_datetime(dt)
-
-	if parsed.tzinfo is not None:
-		parsed = parsed.astimezone(timezone.utc)
-	return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+	target = datetime.now(timezone.utc) if dt is None else dt
+	return format_sp_api_utc_datetime(target) or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def is_item_mapped_to_amazon(item_code: str | None) -> bool:
@@ -965,8 +958,14 @@ def _has_stock_delta(item_code: str, last_synced_on, warehouses: tuple[str, ...]
 	filters: dict = {"item_code": item_code}
 	if warehouses:
 		filters["warehouse"] = ["in", list(warehouses)]
-	latest = frappe.get_all("Bin", filters=filters, fields=["max(modified) as latest_modified"], limit=1)
-	latest_modified = latest[0].get("latest_modified") if latest else None
+	latest = frappe.get_all(
+		"Bin",
+		filters=filters,
+		fields=["modified"],
+		order_by="modified desc",
+		limit=1,
+	)
+	latest_modified = latest[0].get("modified") if latest else None
 	if not latest_modified:
 		return False
 	return get_datetime(latest_modified) > last_sync_dt

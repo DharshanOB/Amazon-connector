@@ -732,6 +732,13 @@ def _drop_amazon_fields_map_unique_indexes() -> None:
 
 def sync_amazon_extensions_fixtures():
 	"""Drop deprecated dev fields and ensure all Amazon extension fixtures are tagged to EXT_MODULE."""
+	if not frappe.db.exists("Custom Field", "Sales Order-amazon_order_id"):
+		from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api_settings import (
+			setup_custom_fields,
+		)
+
+		setup_custom_fields()
+
 	for cf_name in DEPRECATED_CUSTOM_FIELDS:
 		if frappe.db.exists("Custom Field", cf_name):
 			frappe.delete_doc("Custom Field", cf_name, ignore_permissions=True)

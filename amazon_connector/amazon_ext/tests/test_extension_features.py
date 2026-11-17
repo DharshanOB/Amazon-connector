@@ -1053,3 +1053,30 @@ class TestAmazonExtensionIntegration(IntegrationTestCase):
 				frappe.delete_doc("Item Price", p.name, force=1, ignore_permissions=True)
 			frappe.delete_doc("Item", item_code, force=1, ignore_permissions=True)
 
+	def test_utc_timestamp_conversion_has_stock_delta_and_so_custom_field(self):
+		from amazon_connector.amazon_ext import fulfillment as amazon_fulfillment
+		from amazon_connector.amazon_ext.lifecycle import format_sp_api_utc_datetime
+
+		with patch("amazon_connector.amazon_ext.lifecycle.get_system_timezone", return_value="Asia/Kolkata"):
+			self.assertEqual(format_sp_api_utc_datetime("2026-11-17 16:09:02.281490"), "2026-11-17T10:39:02Z")
+			self.assertEqual(format_sp_api_utc_datetime("2026-11-17T16:09:02"), "2026-11-17T10:39:02Z")
+			self.assertEqual(format_sp_api_utc_datetime("2026-11-17T10:39:02Z"), "2026-11-17T10:39:02Z")
+			self.assertEqual(format_sp_api_utc_datetime("2026-11-11"), "2026-11-11T00:00:00Z")
+
+			repo = _make_fake_repo("Test Co", "WH-1")
+			orders_api = MagicMock()
+			orders_api.get_orders.return_value = {"payload": {"Orders": []}}
+			with (
+				patch.object(repo, "get_orders_instance", return_value=orders_api),
+				patch("amazon_connector.amazon_ext.repository.update_setting_sync_timestamp"),
+			):
+				repo.get_orders(last_updated_after="2026-11-17 16:09:02")
+				self.assertEqual(
+					orders_api.get_orders.call_args.kwargs["last_updated_after"],
+					"2026-11-17T10:39:02Z",
+				)
+
+		# Ensure Frappe v16 Bin delta check runs without SQL string aggregates
+		self.assertFalse(amazon_fulfillment._has_stock_delta("NON-EXISTENT-ITEM-9999", "2026-11-17 00:00:00", ()))
+		self.assertTrue(bool(frappe.db.exists("Custom Field", "Sales Order-amazon_order_id")))
+

@@ -22,6 +22,9 @@ class CustomAmazonSPAPISettings(_BaseAmazonSPAPISettings):
 	"""Extension controller for Amazon SP API Settings via override_doctype_class."""
 
 	def validate(self):
+		if not frappe.db.exists("Custom Field", "Sales Order-amazon_order_id"):
+			_upstream_settings.setup_custom_fields()
+
 		self.validate_amazon_fields_map()
 		self.validate_after_date()
 

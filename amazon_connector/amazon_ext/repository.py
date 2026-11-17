@@ -15,6 +15,7 @@ from amazon_connector.amazon_ext.lifecycle import (
 	AMAZON_MODULE_DEF,
 	cancel_erpnext_order_from_amazon,
 	create_sales_invoice_from_sales_order,
+	format_sp_api_utc_datetime,
 	get_marketplace_id_for_setting,
 	get_or_create_leaf_account,
 	update_setting_sync_timestamp,
@@ -896,14 +897,9 @@ class CustomAmazonRepository(_BaseAmazonRepository):
 			"max_results": 50,
 		}
 		if last_updated_after and not created_after:
-			iso_val = (
-				last_updated_after
-				if isinstance(last_updated_after, str) and "T" in last_updated_after
-				else dateutil.parser.parse(str(last_updated_after)).strftime("%Y-%m-%dT%H:%M:%SZ")
-			)
-			query_kwargs["last_updated_after"] = iso_val
-		else:
-			query_kwargs["created_after"] = created_after
+			query_kwargs["last_updated_after"] = format_sp_api_utc_datetime(last_updated_after)
+		elif created_after:
+			query_kwargs["created_after"] = format_sp_api_utc_datetime(created_after)
 
 		rdt = self._get_orders_rdt()
 		if rdt:
