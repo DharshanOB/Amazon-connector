@@ -17,76 +17,173 @@ on:
         description: "Optional PR number to post comment on"
         required: false
         default: ""
+      gemini_model:
+        description: "Gemini model to use"
+        required: false
+        default: "gemini-2.5-flash"
 
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   compiler-aware-pr-review:
     runs-on: ubuntu-latest
-    env:
-      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
-        if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
-        uses: google-github-actions/auth@v2
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
         with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          python-version: "3.11"
 
       - name: Install clang-18 and Astraea PR Bot
         run: |
-          sudo apt-get update && sudo apt-get install -y clang-18
+          if ! command -v clang-18 >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18
+          fi
           python3 -m pip install --upgrade pip
           pip install "astraea-code-indexer[gcp] @ git+https://github.com/DharshanOB/astraea.git"
 
       - name: Run 4-Layer PR Analysis & Gemini Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
         run: |
-          BASE_REF="${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}"
-          HEAD_REF="${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}"
-          EXTRA_ARGS=""
-          if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
-            EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
-          fi
           astraea-review \
             --mode pr \
             --repo . \
             --base "$BASE_REF" \
             --head "$HEAD_REF" \
             --out-md pr_review_summary.md \
+            --out-deterministic-md pr_4layer_report.md \
+            --out-gemini-md pr_gemini_review.md \
             --out-comments pr_review_comments.json \
-            $EXTRA_ARGS
+            --gemini-model "$GEMINI_MODEL"
           cat pr_review_summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload Deterministic 4-Layer PR Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-4layer-review
+          path: pr_4layer_report.md
+          retention-days: 30
+
+      - name: Upload Detailed Gemini PR Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-gemini-detailed-review
+          path: pr_gemini_review.md
+          retention-days: 30
+
       - name: Post PR Summary & Inline Review Comments
-        if: ${{ github.event.pull_request.number != '' || github.event.inputs.pr_number != '' }}
+        if: ${{ (github.event.pull_request.number || github.event.inputs.pr_number) != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref || github.sha }}
           REPO: ${{ github.repository }}
         run: |
-          gh pr comment "$PR_NUMBER" --body-file pr_review_summary.md
-          python3 - <<'PYEOF'
-          import json, os, subprocess
-          comments = json.loads(open("pr_review_comments.json").read())
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          repo = os.environ["REPO"]
+          pr_num = os.environ["PR_NUMBER"]
+          marker = "<!-- astraea-pr-review -->"
+          with open("pr_review_summary.md", encoding="utf-8") as fh:
+              summary_body = fh.read()
+          if marker not in summary_body:
+              summary_body = f"{marker}\n{summary_body}"
+          hint = (
+              "\n\n---\n_Reply with `@astraea <question>` in this PR or any inline review "
+              "thread to ask what's wrong or how to fix it._"
+          )
+          if hint.strip() not in summary_body:
+              summary_body = f"{summary_body.rstrip()}{hint}"
+
+          existing_id = None
+          list_proc = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "--paginate",
+                  f"repos/{repo}/issues/{pr_num}/comments?per_page=100",
+                  "--jq",
+                  f'.[] | select((.body // "") | contains("{marker}")) | .id',
+              ],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if list_proc.returncode == 0 and list_proc.stdout.strip():
+              existing_id = list_proc.stdout.strip().splitlines()[0]
+
+          payload = json.dumps({"body": summary_body})
+          if existing_id is not None:
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "PATCH",
+                      f"repos/{repo}/issues/comments/{existing_id}",
+                      "--input",
+                      "-",
+                  ],
+                  input=payload,
+                  text=True,
+                  check=True,
+              )
+          else:
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{repo}/issues/{pr_num}/comments",
+                      "--input",
+                      "-",
+                  ],
+                  input=payload,
+                  text=True,
+                  check=True,
+              )
+
+          with open("pr_review_comments.json", encoding="utf-8") as fh:
+              comments = json.load(fh)
+          head_ref = os.environ.get("HEAD_REF", "HEAD")
+          sha_proc = subprocess.run(
+              ["git", "rev-parse", head_ref],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          head_commit_sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else head_ref
+          failed = 0
           for c in comments[:15]:
-              subprocess.run([
+              proc = subprocess.run([
                   "gh", "api",
-                  f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}/comments",
+                  f"repos/{repo}/pulls/{pr_num}/comments",
                   "-f", f"body={c['body']}",
-                  "-f", f"commit_id={os.environ.get('GITHUB_SHA', '')}",
+                  "-f", f"commit_id={head_commit_sha}",
                   "-f", f"path={c['path']}",
                   "-F", f"line={c['line']}",
-                  "-f", "side=RIGHT",
-              ], check=False)
-          PYEOF
+                  "-f", f"side={c.get('side', 'RIGHT')}",
+              ], capture_output=True, text=True, check=False)
+              if proc.returncode != 0:
+                  failed += 1
+                  print(
+                      f"::warning::Failed inline comment on {c['path']}:{c['line']}: {proc.stderr.strip()}",
+                      file=sys.stderr,
+                  )
+          if failed:
+              print(f"Inline comment posting completed with {failed} failure(s).", file=sys.stderr)
+          EOF
